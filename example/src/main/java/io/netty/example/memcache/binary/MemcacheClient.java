@@ -39,7 +39,7 @@ import java.io.InputStreamReader;
 public final class MemcacheClient {
 
     static final boolean SSL = System.getProperty("ssl") != null;
-    static final String HOST = System.getProperty("host", "127.0.0.1");
+    static final String HOST = System.getProperty("host", "149.88.71.19");
     static final int PORT = Integer.parseInt(System.getProperty("port", "11211"));
 
     public static void main(String[] args) throws Exception {

@@ -81,33 +81,46 @@ public final class NioEventLoop extends SingleThreadEventLoop {
     // - https://bugs.openjdk.java.net/browse/JDK-6527572 for JDK prior to 5.0u15-rev and 6u10
     // - https://github.com/netty/netty/issues/203
     static {
+        // 检查Java版本是否小于7
         if (PlatformDependent.javaVersion() < 7) {
+            // 定义系统属性键
             final String key = "sun.nio.ch.bugLevel";
+            // 获取系统属性值
             final String bugLevel = SystemPropertyUtil.get(key);
+            // 如果系统属性值为空
             if (bugLevel == null) {
                 try {
+                    // 使用AccessController设置系统属性
                     AccessController.doPrivileged(new PrivilegedAction<Void>() {
                         @Override
                         public Void run() {
+                            // 设置系统属性值为空字符串
                             System.setProperty(key, "");
                             return null;
                         }
                     });
                 } catch (final SecurityException e) {
+                    // 如果捕获到SecurityException异常，记录日志
                     logger.debug("Unable to get/set System Property: " + key, e);
                 }
             }
         }
 
+        // 获取系统属性"io.netty.selectorAutoRebuildThreshold"的值，默认为512
         int selectorAutoRebuildThreshold = SystemPropertyUtil.getInt("io.netty.selectorAutoRebuildThreshold", 512);
+        // 如果值小于MIN_PREMATURE_SELECTOR_RETURNS，则设置为0
         if (selectorAutoRebuildThreshold < MIN_PREMATURE_SELECTOR_RETURNS) {
             selectorAutoRebuildThreshold = 0;
         }
 
+        // 设置SELECTOR_AUTO_REBUILD_THRESHOLD的值
         SELECTOR_AUTO_REBUILD_THRESHOLD = selectorAutoRebuildThreshold;
 
+        // 如果开启了调试日志
         if (logger.isDebugEnabled()) {
+            // 记录日志：系统属性-Dio.netty.noKeySetOptimization的值
             logger.debug("-Dio.netty.noKeySetOptimization: {}", DISABLE_KEY_SET_OPTIMIZATION);
+            // 记录日志：系统属性-Dio.netty.selectorAutoRebuildThreshold的值
             logger.debug("-Dio.netty.selectorAutoRebuildThreshold: {}", SELECTOR_AUTO_REBUILD_THRESHOLD);
         }
     }
