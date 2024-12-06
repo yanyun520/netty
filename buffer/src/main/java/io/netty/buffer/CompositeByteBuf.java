@@ -370,10 +370,13 @@ public class CompositeByteBuf extends AbstractReferenceCountedByteBuf implements
 
     private CompositeByteBuf addComponents0(boolean increaseWriterIndex,
             final int cIndex, ByteBuf[] buffers, int arrOffset) {
+        // 获取缓冲区的长度和要处理的缓冲区数量
         final int len = buffers.length, count = len - arrOffset;
 
+        // 初始化可读字节数和容量
         int readableBytes = 0;
         int capacity = capacity();
+        // 遍历缓冲区数组，累加可读字节数，并检查是否溢出
         for (int i = arrOffset; i < buffers.length; i++) {
             ByteBuf b = buffers[i];
             if (b == null) {
@@ -381,16 +384,22 @@ public class CompositeByteBuf extends AbstractReferenceCountedByteBuf implements
             }
             readableBytes += b.readableBytes();
 
+            // 检查是否会溢出，见 https://github.com/netty/netty/issues/10194
             // Check if we would overflow.
             // See https://github.com/netty/netty/issues/10194
             checkForOverflow(capacity, readableBytes);
         }
+        // 初始化组件索引为最大值，确保在finally块中逻辑正确
         // only set ci after we've shifted so that finally block logic is always correct
         int ci = Integer.MAX_VALUE;
         try {
+            // 检查组件索引是否有效
             checkComponentIndex(cIndex);
+            // 移动组件，增加组件数量
             shiftComps(cIndex, count); // will increase componentCount
+            // 计算下一个组件的起始偏移量
             int nextOffset = cIndex > 0 ? components[cIndex - 1].endOffset : 0;
+            // 遍历缓冲区数组，创建并添加组件
             for (ci = cIndex; arrOffset < len; arrOffset++, ci++) {
                 ByteBuf b = buffers[arrOffset];
                 if (b == null) {
@@ -400,19 +409,24 @@ public class CompositeByteBuf extends AbstractReferenceCountedByteBuf implements
                 components[ci] = c;
                 nextOffset = c.endOffset;
             }
+            // 返回当前对象
             return this;
         } finally {
+            // ci 现在表示最后成功添加的组件之后的索引
             // ci is now the index following the last successfully added component
             if (ci < componentCount) {
                 if (ci < cIndex + count) {
+                    // 如果提前退出循环，则移除未添加的组件，并释放缓冲区
                     // we bailed early
                     removeCompRange(ci, cIndex + count);
                     for (; arrOffset < len; ++arrOffset) {
                         ReferenceCountUtil.safeRelease(buffers[arrOffset]);
                     }
                 }
+                // 更新组件偏移量，只需对添加的组件之后的组件进行操作
                 updateComponentOffsets(ci); // only need to do this here for components after the added ones
             }
+            // 如果需要增加writerIndex，则更新writerIndex
             if (increaseWriterIndex && ci > cIndex && ci <= componentCount) {
                 writerIndex += components[ci - 1].endOffset - components[cIndex].offset;
             }
