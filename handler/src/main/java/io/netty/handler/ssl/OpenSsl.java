@@ -35,6 +35,7 @@ import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
 import java.io.ByteArrayInputStream;
+import java.nio.ByteBuffer;
 import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
 import java.util.ArrayList;
@@ -42,6 +43,7 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
@@ -153,9 +155,9 @@ public final class OpenSsl {
             boolean useKeyManagerFactory = false;
             boolean tlsv13Supported = false;
             String[] namedGroups = DEFAULT_NAMED_GROUPS;
-            String[] defaultConvertedNamedGroups = new String[namedGroups.length];
+            Set<String> defaultConvertedNamedGroups = new LinkedHashSet<String>(namedGroups.length);
             for (int i = 0; i < namedGroups.length; i++) {
-                defaultConvertedNamedGroups[i] = GroupsConverter.toOpenSsl(namedGroups[i]);
+                defaultConvertedNamedGroups.add(GroupsConverter.toOpenSsl(namedGroups[i]));
             }
 
             IS_BORINGSSL = "BoringSSL".equals(versionString());
@@ -177,6 +179,22 @@ public final class OpenSsl {
 
             try {
                 final long sslCtx = SSLContext.make(SSL.SSL_PROTOCOL_ALL, SSL.SSL_MODE_SERVER);
+
+                // Let's filter out any group that is not supported from the default.
+                Iterator<String> defaultGroupsIter = defaultConvertedNamedGroups.iterator();
+                while (defaultGroupsIter.hasNext()) {
+                    if (!SSLContext.setCurvesList(sslCtx, defaultGroupsIter.next())) {
+                        // Not supported, let's remove it. This could for example be the case if we use
+                        // fips and the configure group is not supported when using FIPS.
+                        // See https://github.com/netty/netty-tcnative/issues/883
+                        defaultGroupsIter.remove();
+
+                        // Clear the error as otherwise we might fail later.
+                        SSL.clearError();
+                    }
+                }
+                namedGroups = defaultConvertedNamedGroups.toArray(EmptyArrays.EMPTY_STRINGS);
+
                 long certBio = 0;
                 long keyBio = 0;
                 long cert = 0;
@@ -204,6 +222,7 @@ public final class OpenSsl {
 
                         } catch (Exception ignore) {
                             tlsv13Supported = false;
+                            SSL.clearError();
                         }
                     }
 
@@ -269,8 +288,9 @@ public final class OpenSsl {
                             } catch (Throwable ignore) {
                                 logger.debug("Failed to get useKeyManagerFactory system property.");
                             }
-                        } catch (Error ignore) {
-                            logger.debug("KeyManagerFactory not supported.");
+                        } catch (Exception e) {
+                            logger.debug("KeyManagerFactory not supported", e);
+                            SSL.clearError();
                         } finally {
                             privateKey.release();
                         }
@@ -304,11 +324,14 @@ public final class OpenSsl {
                                 supportedNamedGroups.add(namedGroup);
                             } else {
                                 unsupportedNamedGroups.add(namedGroup);
+
+                                // Clear the error as otherwise we might fail later.
+                                SSL.clearError();
                             }
                         }
 
                         if (supportedNamedGroups.isEmpty()) {
-                            namedGroups = defaultConvertedNamedGroups;
+                            namedGroups = defaultConvertedNamedGroups.toArray(EmptyArrays.EMPTY_STRINGS);
                             logger.info("All configured namedGroups are not supported: {}. Use default: {}.",
                                     Arrays.toString(unsupportedNamedGroups.toArray(EmptyArrays.EMPTY_STRINGS)),
                                     Arrays.toString(DEFAULT_NAMED_GROUPS));
@@ -322,10 +345,10 @@ public final class OpenSsl {
                                         Arrays.toString(groupArray),
                                         Arrays.toString(unsupportedNamedGroups.toArray(EmptyArrays.EMPTY_STRINGS)));
                             }
-                            namedGroups =  supportedConvertedNamedGroups.toArray(EmptyArrays.EMPTY_STRINGS);
+                            namedGroups = supportedConvertedNamedGroups.toArray(EmptyArrays.EMPTY_STRINGS);
                         }
                     } else {
-                        namedGroups = defaultConvertedNamedGroups;
+                        namedGroups = defaultConvertedNamedGroups.toArray(EmptyArrays.EMPTY_STRINGS);
                     }
                 } finally {
                     SSLContext.free(sslCtx);
@@ -340,8 +363,14 @@ public final class OpenSsl {
             for (String cipher: AVAILABLE_OPENSSL_CIPHER_SUITES) {
                 // Included converted but also openssl cipher name
                 if (!isTLSv13Cipher(cipher)) {
-                    availableJavaCipherSuites.add(CipherSuiteConverter.toJava(cipher, "TLS"));
-                    availableJavaCipherSuites.add(CipherSuiteConverter.toJava(cipher, "SSL"));
+                    final String tlsConversion = CipherSuiteConverter.toJava(cipher, "TLS");
+                    if (tlsConversion != null) {
+                        availableJavaCipherSuites.add(tlsConversion);
+                    }
+                    final String sslConversion = CipherSuiteConverter.toJava(cipher, "SSL");
+                    if (sslConversion != null) {
+                        availableJavaCipherSuites.add(sslConversion);
+                    }
                 } else {
                     // TLSv1.3 ciphers have the correct format.
                     availableJavaCipherSuites.add(cipher);
@@ -645,9 +674,14 @@ public final class OpenSsl {
 
     static long memoryAddress(ByteBuf buf) {
         assert buf.isDirect();
-        return buf.hasMemoryAddress() ? buf.memoryAddress() :
-                // Use internalNioBuffer to reduce object creation.
-                Buffer.address(buf.internalNioBuffer(0, buf.readableBytes()));
+        if (buf.hasMemoryAddress()) {
+            return buf.memoryAddress();
+        }
+        // Use internalNioBuffer to reduce object creation.
+        // It is important to add the position as the returned ByteBuffer might be shared by multiple ByteBuf
+        // instances and so has an address that starts before the start of the ByteBuf itself.
+        ByteBuffer byteBuffer = buf.internalNioBuffer(0, buf.readableBytes());
+        return Buffer.address(byteBuffer) + byteBuffer.position();
     }
 
     private OpenSsl() { }
@@ -699,7 +733,8 @@ public final class OpenSsl {
 
     static boolean isOptionSupported(SslContextOption<?> option) {
         if (isAvailable()) {
-            if (option == OpenSslContextOption.USE_TASKS) {
+            if (option == OpenSslContextOption.USE_TASKS ||
+                    option == OpenSslContextOption.TMP_DH_KEYLENGTH) {
                 return true;
             }
             // Check for options that are only supported by BoringSSL atm.

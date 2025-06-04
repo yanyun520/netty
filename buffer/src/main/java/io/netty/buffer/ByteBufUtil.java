@@ -22,6 +22,7 @@ import io.netty.util.IllegalReferenceCountException;
 import io.netty.util.Recycler.EnhancedHandle;
 import io.netty.util.ResourceLeakDetector;
 import io.netty.util.concurrent.FastThreadLocal;
+import io.netty.util.concurrent.FastThreadLocalThread;
 import io.netty.util.internal.MathUtil;
 import io.netty.util.internal.ObjectPool;
 import io.netty.util.internal.ObjectPool.Handle;
@@ -45,7 +46,6 @@ import java.nio.charset.CharsetEncoder;
 import java.nio.charset.CoderResult;
 import java.nio.charset.CodingErrorAction;
 import java.util.Arrays;
-import java.util.Locale;
 
 import static io.netty.util.internal.MathUtil.isOutOfBounds;
 import static io.netty.util.internal.ObjectUtil.checkNotNull;
@@ -79,7 +79,6 @@ public final class ByteBufUtil {
     static {
         String allocType = SystemPropertyUtil.get(
                 "io.netty.allocator.type", PlatformDependent.isAndroid() ? "unpooled" : "pooled");
-        allocType = allocType.toLowerCase(Locale.US).trim();
 
         ByteBufAllocator alloc;
         if ("unpooled".equals(allocType)) {
@@ -87,6 +86,9 @@ public final class ByteBufUtil {
             logger.debug("-Dio.netty.allocator.type: {}", allocType);
         } else if ("pooled".equals(allocType)) {
             alloc = PooledByteBufAllocator.DEFAULT;
+            logger.debug("-Dio.netty.allocator.type: {}", allocType);
+        } else if ("adaptive".equals(allocType)) {
+            alloc = new AdaptiveByteBufAllocator();
             logger.debug("-Dio.netty.allocator.type: {}", allocType);
         } else {
             alloc = PooledByteBufAllocator.DEFAULT;
@@ -108,8 +110,13 @@ public final class ByteBufUtil {
      * Allocates a new array if minLength > {@link ByteBufUtil#MAX_TL_ARRAY_LEN}
      */
     static byte[] threadLocalTempArray(int minLength) {
-        return minLength <= MAX_TL_ARRAY_LEN ? BYTE_ARRAYS.get()
-            : PlatformDependent.allocateUninitializedArray(minLength);
+        // Only make use of ThreadLocal if we use a FastThreadLocalThread to make the implementation
+        // Virtual Thread friendly.
+        // See https://github.com/netty/netty/issues/14609
+        if (minLength <= MAX_TL_ARRAY_LEN && Thread.currentThread() instanceof FastThreadLocalThread) {
+            return BYTE_ARRAYS.get();
+        }
+        return PlatformDependent.allocateUninitializedArray(minLength);
     }
 
     /**
@@ -714,20 +721,92 @@ public final class ByteBufUtil {
         }
     }
 
-    static int lastIndexOf(AbstractByteBuf buffer, int fromIndex, int toIndex, byte value) {
+    static int lastIndexOf(final AbstractByteBuf buffer, int fromIndex, final int toIndex, final byte value) {
         assert fromIndex > toIndex;
         final int capacity = buffer.capacity();
         fromIndex = Math.min(fromIndex, capacity);
-        if (fromIndex < 0 || capacity == 0) {
+        if (fromIndex <= 0) { // fromIndex is the exclusive upper bound.
             return -1;
         }
-        buffer.checkIndex(toIndex, fromIndex - toIndex);
+        final int length = fromIndex - toIndex;
+        buffer.checkIndex(toIndex, length);
+        if (!PlatformDependent.isUnaligned()) {
+            return linearLastIndexOf(buffer, fromIndex, toIndex, value);
+        }
+        final int longCount = length >>> 3;
+        if (longCount > 0) {
+            final ByteOrder nativeOrder = ByteOrder.nativeOrder();
+            final boolean isNative = nativeOrder == buffer.order();
+            final boolean useLE = nativeOrder == ByteOrder.LITTLE_ENDIAN;
+            final long pattern = SWARUtil.compilePattern(value);
+            for (int i = 0, offset = fromIndex - Long.BYTES; i < longCount; i++, offset -= Long.BYTES) {
+                // use the faster available getLong
+                final long word = useLE? buffer._getLongLE(offset) : buffer._getLong(offset);
+                final long result = SWARUtil.applyPattern(word, pattern);
+                if (result != 0) {
+                    // used the oppoiste endianness since we are looking for the last index.
+                    return offset + Long.BYTES - 1 - SWARUtil.getIndex(result, !isNative);
+                }
+            }
+        }
+        return unrolledLastIndexOf(buffer, fromIndex - (longCount << 3), length & 7, value);
+    }
+
+    private static int linearLastIndexOf(final AbstractByteBuf buffer, final int fromIndex, final int toIndex,
+                                         final byte value) {
         for (int i = fromIndex - 1; i >= toIndex; i--) {
             if (buffer._getByte(i) == value) {
                 return i;
             }
         }
+        return -1;
+    }
 
+    private static int unrolledLastIndexOf(final AbstractByteBuf buffer, final int fromIndex, final int byteCount,
+                                           final byte value) {
+        assert byteCount >= 0 && byteCount < 8;
+        if (byteCount == 0) {
+            return -1;
+        }
+        if (buffer._getByte(fromIndex - 1) == value) {
+            return fromIndex - 1;
+        }
+        if (byteCount == 1) {
+            return -1;
+        }
+        if (buffer._getByte(fromIndex - 2) == value) {
+            return fromIndex - 2;
+        }
+        if (byteCount == 2) {
+            return -1;
+        }
+        if (buffer._getByte(fromIndex - 3) == value) {
+            return fromIndex - 3;
+        }
+        if (byteCount == 3) {
+            return -1;
+        }
+        if (buffer._getByte(fromIndex - 4) == value) {
+            return fromIndex - 4;
+        }
+        if (byteCount == 4) {
+            return -1;
+        }
+        if (buffer._getByte(fromIndex - 5) == value) {
+            return fromIndex - 5;
+        }
+        if (byteCount == 5) {
+            return -1;
+        }
+        if (buffer._getByte(fromIndex - 6) == value) {
+            return fromIndex - 6;
+        }
+        if (byteCount == 6) {
+            return -1;
+        }
+        if (buffer._getByte(fromIndex - 7) == value) {
+            return fromIndex - 7;
+        }
         return -1;
     }
 

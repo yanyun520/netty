@@ -28,7 +28,6 @@ import io.netty.util.AsciiString;
 import io.netty.util.CharsetUtil;
 import io.netty.util.NetUtil;
 import io.netty.util.internal.ObjectUtil;
-import io.netty.util.internal.UnstableApi;
 
 import static io.netty.util.internal.StringUtil.COMMA;
 import static io.netty.util.internal.ObjectUtil.checkPositiveOrZero;
@@ -548,7 +547,11 @@ public final class HttpUtil {
         if (NetUtil.isValidIpV6Address(hostString)) {
             if (!addr.isUnresolved()) {
                 hostString = NetUtil.toAddressString(addr.getAddress());
+            } else if (hostString.charAt(0) == '[' && hostString.charAt(hostString.length() - 1) == ']') {
+                // If IPv6 address already contains brackets, let's return as is.
+                return hostString;
             }
+
             return '[' + hostString + ']';
         }
         return hostString;
@@ -564,7 +567,6 @@ public final class HttpUtil {
      * @return the normalized content length from the headers or {@code -1} if the fields were empty.
      * @throws IllegalArgumentException if the content-length fields are not valid
      */
-    @UnstableApi
     public static long normalizeAndGetContentLength(
             List<? extends CharSequence> contentLengthFields, boolean isHttp10OrEarlier,
             boolean allowDuplicateContentLengths) {
@@ -629,4 +631,148 @@ public final class HttpUtil {
                     "Content-Length value is not a number: " + firstField, e);
         }
     }
+
+    /**
+     * Validate a <a href="https://tools.ietf.org/html/rfc7230#section-3.2.6">token</a> contains only allowed
+     * characters.
+     * <p>
+     * The <a href="https://tools.ietf.org/html/rfc2616#section-2.2">token</a> format is used for variety of HTTP
+     * components, like  <a href="https://tools.ietf.org/html/rfc6265#section-4.1.1">cookie-name</a>,
+     * <a href="https://tools.ietf.org/html/rfc7230#section-3.2.6">field-name</a> of a
+     * <a href="https://tools.ietf.org/html/rfc7230#section-3.2">header-field</a>, or
+     * <a href="https://tools.ietf.org/html/rfc7231#section-4">request method</a>.
+     *
+     * @param token the token to validate.
+     * @return the index of the first invalid token character found, or {@code -1} if there are none.
+     */
+    static int validateToken(CharSequence token) {
+        if (token instanceof AsciiString) {
+            return validateAsciiStringToken((AsciiString) token);
+        }
+        return validateCharSequenceToken(token);
+    }
+
+    /**
+     * Validate that an {@link AsciiString} contain onlu valid
+     * <a href="https://tools.ietf.org/html/rfc7230#section-3.2.6">token</a> characters.
+     *
+     * @param token the ascii string to validate.
+     */
+    private static int validateAsciiStringToken(AsciiString token) {
+        byte[] array = token.array();
+        for (int i = token.arrayOffset(), len = token.arrayOffset() + token.length(); i < len; i++) {
+            if (!isValidTokenChar(array[i])) {
+                return i - token.arrayOffset();
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * Validate that a {@link CharSequence} contain onlu valid
+     * <a href="https://tools.ietf.org/html/rfc7230#section-3.2.6">token</a> characters.
+     *
+     * @param token the character sequence to validate.
+     */
+    private static int validateCharSequenceToken(CharSequence token) {
+        for (int i = 0, len = token.length(); i < len; i++) {
+            byte value = (byte) token.charAt(i);
+            if (!isValidTokenChar(value)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    // HEADER
+    // header-field   = field-name ":" OWS field-value OWS
+    //
+    // field-name     = token
+    // token          = 1*tchar
+    //
+    // tchar          = "!" / "#" / "$" / "%" / "&" / "'" / "*"
+    //                    / "+" / "-" / "." / "^" / "_" / "`" / "|" / "~"
+    //                    / DIGIT / ALPHA
+    //                    ; any VCHAR, except delimiters.
+    //  Delimiters are chosen
+    //   from the set of US-ASCII visual characters not allowed in a token
+    //   (DQUOTE and "(),/:;<=>?@[\]{}")
+    //
+    // COOKIE
+    // cookie-pair       = cookie-name "=" cookie-value
+    // cookie-name       = token
+    // token          = 1*<any CHAR except CTLs or separators>
+    // CTL = <any US-ASCII control character
+    //       (octets 0 - 31) and DEL (127)>
+    // separators     = "(" | ")" | "<" | ">" | "@"
+    //                      | "," | ";" | ":" | "\" | <">
+    //                      | "/" | "[" | "]" | "?" | "="
+    //                      | "{" | "}" | SP | HT
+    //
+    // field-name's token is equivalent to cookie-name's token, we can reuse the tchar mask for both:
+
+    //    private static final class BitSet128 {
+    //        private long high;
+    //        private long low;
+    //
+    //        BitSet128 range(char fromInc, char toInc) {
+    //            for (int bit = fromInc; bit <= toInc; bit++) {
+    //                if (bit < 64) {
+    //                    low |= 1L << bit;
+    //                } else {
+    //                    high |= 1L << bit - 64;
+    //                }
+    //            }
+    //            return this;
+    //        }
+    //
+    //        BitSet128 bits(char... bits) {
+    //            for (char bit : bits) {
+    //                if (bit < 64) {
+    //                    low |= 1L << bit;
+    //                } else {
+    //                    high |= 1L << bit - 64;
+    //                }
+    //            }
+    //            return this;
+    //        }
+    //
+    //        long high() {
+    //            return high;
+    //        }
+    //
+    //        long low() {
+    //            return low;
+    //        }
+    //
+    //        static boolean contains(byte bit, long high, long low) {
+    //            if (bit < 0) {
+    //                return false;
+    //            }
+    //            if (bit < 64) {
+    //                return 0 != (low & 1L << bit);
+    //            }
+    //            return 0 != (high & 1L << bit - 64);
+    //        }
+    //    }
+
+    // BitSet128 tokenChars = new BitSet128()
+    //        .range('0', '9').range('a', 'z').range('A', 'Z') // Alphanumeric.
+    //        .bits('-', '.', '_', '~') // Unreserved characters.
+    //        .bits('!', '#', '$', '%', '&', '\'', '*', '+', '^', '`', '|'); // Token special characters.
+
+    //this constants calculated by the above code
+    private static final long TOKEN_CHARS_HIGH = 0x57ffffffc7fffffeL;
+    private static final long TOKEN_CHARS_LOW = 0x3ff6cfa00000000L;
+
+    private static boolean isValidTokenChar(byte bit) {
+        if (bit < 0) {
+            return false;
+        }
+        if (bit < 64) {
+            return 0 != (TOKEN_CHARS_LOW & 1L << bit);
+        }
+        return 0 != (TOKEN_CHARS_HIGH & 1L << bit - 64);
+    }
+
 }
