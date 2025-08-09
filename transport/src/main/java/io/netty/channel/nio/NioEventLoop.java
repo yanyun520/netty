@@ -668,8 +668,11 @@ public final class NioEventLoop extends SingleThreadEventLoop {
 
     private void processSelectedKeys() {
         if (selectedKeys != null) {
+            //在大量连接的场景下，把“遍历所有 SelectionKey”变成“只遍历真正就绪的 Key”，
+            // 从而把 O(n) 降到 O(k)（k = 就绪 key 数），减少 CPU 分支与缓存失效。
             processSelectedKeysOptimized();
         } else {
+            //原生方法，需要遍历所有的key
             processSelectedKeysPlain(selector.selectedKeys());
         }
     }
@@ -732,11 +735,19 @@ public final class NioEventLoop extends SingleThreadEventLoop {
         }
     }
 
+    /**
+     * | 优化项                   | 实现细节                                                                                            | 效果                                       |
+     * | --------------------- | ----------------------------------------------------------------------------------------------- | ---------------------------------------- |
+     * | **数组替换 HashSet**      | Netty 把 `Selector.selectedKeys()` 反射替换成 **自己实现的 SelectedSelectionKeySet**（底层是 `SelectionKey[]`） | 去掉 HashSet 的哈希计算 & 链表遍历，CPU 分支 **↓50 %** |
+     * | **连续内存 + 无 Iterator** | 就绪 key 直接按顺序写入数组，无需 Iterator，**无 remove 操作**                                                    | 减少 GC 根扫描、分支预测失败                         |
+     * | **只遍历就绪区间**           | 记录 `size` 字段，循环 `for (int i = 0; i < size; i++)`                                                | 真正 **O(k)**，k ≈ 就绪 key 数                 |
+     * | **批量唤醒优化**            | 当 EventLoop 被外部线程唤醒时，会把唤醒任务一次性处理完，避免多次 Selector wakeup                                          | 减少系统调用开销                                 |
+     */
     private void processSelectedKeysOptimized() {
         for (int i = 0; i < selectedKeys.size; ++i) {
             final SelectionKey k = selectedKeys.keys[i];
             // null out entry in the array to allow to have it GC'ed once the Channel close
-            // See https://github.com/netty/netty/issues/2363
+            // See https://github.com/netty/netty/issues/23631
             selectedKeys.keys[i] = null;
 
             final Object a = k.attachment();
@@ -783,13 +794,35 @@ public final class NioEventLoop extends SingleThreadEventLoop {
             return;
         }
 
+        /**
+         * 逐行把它拆开，你就能明白 Netty 为什么要「先 OP_CONNECT，再 OP_WRITE，最后 OP_READ」，
+         * 以及为什么必须 手动把 OP_CONNECT 从 interestOps 里摘掉，否则会吃光 CPU。
+         * selector.select() → readyOps
+         *      │
+         *      ├─ OP_CONNECT → 摘掉 OP_CONNECT → finishConnect()
+         *      │
+         *      ├─ OP_WRITE   → flush 待写数据
+         *      │
+         *      └─ OP_READ    → 读/接收数据
+         */
         try {
+            //readyOps 是本次 epoll/select 返回的 就绪事件位图（OP_CONNECT、OP_WRITE、OP_READ、OP_ACCEPT 的组合）。
             int readyOps = k.readyOps();
             // We first need to call finishConnect() before try to trigger a read(...) or write(...) as otherwise
             // the NIO JDK channel implementation may throw a NotYetConnectedException.
             if ((readyOps & SelectionKey.OP_CONNECT) != 0) {
                 // remove OP_CONNECT as otherwise Selector.select(..) will always return without blocking
                 // See https://github.com/netty/netty/issues/924
+                /**
+                 * 把 OP_CONNECT 从监听集合里摘掉
+                 * JDK bug / 行为：只要 OP_CONNECT 还在监听位里，每次 select 都会立即返回（因为连接已就绪，位一直为 1），于是 EventLoop 空转 → CPU 100 %。
+                 * Netty 用位运算 &= ~OP_CONNECT 立刻把它关掉，避免 “忙等” 死循环（issue #924 的元凶）。
+                 *
+                 *
+                 * 与 OP_READ / OP_WRITE 的区别
+                 *  --- OP_READ / OP_WRITE 是 持续型 事件：只要缓冲区可读/可写，位就会保持。
+                 *  --- OP_CONNECT 是 瞬时型 事件：触发一次即完成使命，需要手动取消。
+                 */
                 int ops = k.interestOps();
                 ops &= ~SelectionKey.OP_CONNECT;
                 k.interestOps(ops);
@@ -797,12 +830,25 @@ public final class NioEventLoop extends SingleThreadEventLoop {
                 unsafe.finishConnect();
             }
 
+            /**
+             * 为什么 先写再读？
+             * – 写操作可能把之前积压的 ByteBuf 全部 flush 掉，立刻释放内存；
+             * – 如果写完仍不可写，会自动把 OP_WRITE 清掉，避免重复回调。
+             */
+
             // Process OP_WRITE first as we may be able to write some queued buffers and so free memory.
             if ((readyOps & SelectionKey.OP_WRITE) != 0) {
                 // Call forceFlush which will also take care of clear the OP_WRITE once there is nothing left to write
                unsafe.forceFlush();
             }
 
+            /**
+             * 普通 socket：读取内核缓冲区的数据，触发 pipeline.fireChannelRead(...)
+             * ServerSocket：接收新连接，触发 pipeline.fireChannelActive(...)
+             * 为什么加 readyOps == 0？
+             * 某些 JDK 版本在收到 TCP RST 时会出现 readyOps == 0 但仍被唤醒的空转 bug；
+             * Netty 把这种情况也交给 unsafe.read() 统一兜底处理，避免 spin loop。
+             */
             // Also check for readOps of 0 to workaround possible JDK bug which may otherwise lead
             // to a spin loop
             if ((readyOps & (SelectionKey.OP_READ | SelectionKey.OP_ACCEPT)) != 0 || readyOps == 0) {
