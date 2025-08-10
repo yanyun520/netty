@@ -139,7 +139,18 @@ public abstract class AbstractNioByteChannel extends AbstractNioChannel {
                 return;
             }
             final ChannelPipeline pipeline = pipeline();
+
+            /**
+             * 默认是 PooledByteBufAllocator(direct)，底层用 jemalloc 风格的 chunk/page/subpage 三级结构 管理堆外内存。
+             * 可通过 -Dio.netty.allocator.type=unpooled 或 channel.config().setAllocator(...) 切换。
+             */
             final ByteBufAllocator allocator = config.getAllocator();
+
+            /**
+             * Handle 是“一次读循环”的上下文，保存了本次应该分配多大的 buffer、上轮读了多少字节、是否继续读等状态。
+             * 4.2 以后默认实现是 AdaptiveRecvByteBufAllocator.HandleImpl；
+             * 它内部维护 指数回退表：64 → 128 → 256 … → 65536（可配置上限），根据 实际读到的字节数 动态调整下一次大小，避免 “大马拉小车” 或 “小马拉大车”。
+             */
             final RecvByteBufAllocator.Handle allocHandle = recvBufAllocHandle();
             allocHandle.reset(config);
 
@@ -147,7 +158,16 @@ public abstract class AbstractNioByteChannel extends AbstractNioChannel {
             boolean close = false;
             try {
                 do {
+                    //HandleImpl.allocate()
+                    // └── allocator.ioBuffer(predictSize)          // 走池化 or 非池化
+                    //      └── PooledByteBufAllocator.newDirectBuffer(size)
+                    //           └── PoolArena.allocate(...)
+                    //                └── PoolChunk.allocate(...)
+                    //                     └── PlatformDependent.allocateDirectNoCleaner(size)
+                    //                          └── JDK 内部：sun.misc.Unsafe.allocateMemory(size)
+                    //                               └── Linux：mmap/malloc 返回一块 4 k 对齐的堆外内存
                     byteBuf = allocHandle.allocate(allocator);
+                    //
                     allocHandle.lastBytesRead(doReadBytes(byteBuf));
                     if (allocHandle.lastBytesRead() <= 0) {
                         // nothing was read. release the buffer.
