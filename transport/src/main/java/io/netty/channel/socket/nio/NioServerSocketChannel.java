@@ -151,17 +151,25 @@ public class NioServerSocketChannel extends AbstractNioMessageChannel
 
     @Override
     protected int doReadMessages(List<Object> buf) throws Exception {
+        // 1. 接受新连接
         SocketChannel ch = SocketUtils.accept(javaChannel());
 
         try {
+            // 2. 判断是否成功接受到连接
             if (ch != null) {
+                // 3. 将新连接封装成 NioSocketChannel，并添加到结果列表中
+                //为什么是 NioSocketChannel？因为 NioServerSocketChannel 的职责是“接受连接”，
+                // 而新创建的 NioSocketChannel 的职责是与那个特定的客户端进行数据读写。
+                // 所以，对于 NioServerSocketChannel 来说，它“读取”到的“消息”就是一个个代表新连接的 NioSocketChannel 对象。
                 buf.add(new NioSocketChannel(this, ch));
+                // 4. 返回 1，表示成功读取了 1 个“消息”
                 return 1;
             }
         } catch (Throwable t) {
             logger.warn("Failed to create a new channel from an accepted socket.", t);
 
             try {
+                // 如果在创建 NioSocketChannel 时出错，确保关闭底层的 SocketChannel，防止资源泄露
                 ch.close();
             } catch (Throwable t2) {
                 logger.warn("Failed to close a socket.", t2);

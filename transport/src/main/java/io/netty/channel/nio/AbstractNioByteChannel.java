@@ -149,6 +149,8 @@ public abstract class AbstractNioByteChannel extends AbstractNioChannel {
             /**
              * Handle 是“一次读循环”的上下文，保存了本次应该分配多大的 buffer、上轮读了多少字节、是否继续读等状态。
              * 4.2 以后默认实现是 AdaptiveRecvByteBufAllocator.HandleImpl；
+             * -- 上一轮读到的字节数保存在  lastBytesRead
+               -- 根据指数表预测本次大小  guess = next(size)
              * 它内部维护 指数回退表：64 → 128 → 256 … → 65536（可配置上限），根据 实际读到的字节数 动态调整下一次大小，避免 “大马拉小车” 或 “小马拉大车”。
              */
             final RecvByteBufAllocator.Handle allocHandle = recvBufAllocHandle();
@@ -167,7 +169,15 @@ public abstract class AbstractNioByteChannel extends AbstractNioChannel {
                     //                          └── JDK 内部：sun.misc.Unsafe.allocateMemory(size)
                     //                               └── Linux：mmap/malloc 返回一块 4 k 对齐的堆外内存
                     byteBuf = allocHandle.allocate(allocator);
-                    //
+                    //真实内存： PoolArena.allocate() → PoolChunk.allocate() → mmap/Unsafe.allocateMemory()
+
+                    //Java:  doReadBytes(byteBuf)
+                    //  ↓
+                    //JNI:   socket.read(ByteBuffer)
+                    //  ↓
+                    //Linux: read(fd, buf, len)   // 用户态 ← 内核态
+                    //  ↓
+                    //Java:  pipeline.fireChannelRead(buf)
                     allocHandle.lastBytesRead(doReadBytes(byteBuf));
                     if (allocHandle.lastBytesRead() <= 0) {
                         // nothing was read. release the buffer.
@@ -272,15 +282,21 @@ public abstract class AbstractNioByteChannel extends AbstractNioChannel {
 
     @Override
     protected void doWrite(ChannelOutboundBuffer in) throws Exception {
+        // 默认 16
         int writeSpinCount = config().getWriteSpinCount();
+        //Netty 用「自旋」而不是「直接阻塞」：
+        // 连续写 16 次还没写完 → 说明内核缓冲区满了，先让出 CPU，等下一次 OP_WRITE 事件再继续。
         do {
-            Object msg = in.current();
+            Object msg = in.current();  // 取出队头消息
             if (msg == null) {
                 // Wrote all messages.
                 clearOpWrite();
                 // Directly return here so incompleteWrite(...) is not called.
                 return;
             }
+            // doWriteInternal  内部：
+            // --- ByteBuf  →  doWriteBytes(buf)  →  SocketChannel.write(ByteBuffer)
+            // --- FileRegion  →  doWriteFileRegion(region)  →  transferTo  零拷贝
             writeSpinCount -= doWriteInternal(in, msg);
         } while (writeSpinCount > 0);
 
@@ -333,6 +349,7 @@ public abstract class AbstractNioByteChannel extends AbstractNioChannel {
     /**
      * Read bytes into the given {@link ByteBuf} and return the amount.
      */
+    //把内核数据搬进 ByteBuf
     protected abstract int doReadBytes(ByteBuf buf) throws Exception;
 
     /**

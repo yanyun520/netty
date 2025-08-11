@@ -895,11 +895,17 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
 
         @SuppressWarnings("deprecation")
         protected void flush0() {
-            if (inFlush0) {
+            //inFlush0 是一个布尔标志位，默认为 false。
+            //方法首先检查 inFlush0 是否为 true。如果是，意味着当前已经有一个 flush0 操作正在执行中。
+            //目的：为了防止并发或递归调用 flush0 导致数据错乱或无限循环。例如，一个 doWrite 的实现可能间接触发了另一次 flush。这个检查保证了在同一时间点，只有一个 flush 流程在执行。
+            if (inFlush0) {  // 重入保护
                 // Avoid re-entrance
                 return;
             }
 
+            //outboundBuffer 是 ChannelOutboundBuffer 类型的对象，它是一个专门用于缓存待发送数据的队列。当调用 channel.write(msg) 时，消息 msg 并没有被立即发送，而是被添加到了这个缓冲区中。
+            //这里会检查 outboundBuffer 是否为 null（通常在 Channel 关闭后会设为 null）或者是否为空（isEmpty()）。
+            //目的：如果没有任何数据需要发送，就直接返回，避免不必要的后续操作。
             final ChannelOutboundBuffer outboundBuffer = this.outboundBuffer;
             if (outboundBuffer == null || outboundBuffer.isEmpty()) {
                 return;
@@ -908,10 +914,16 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
             inFlush0 = true;
 
             // Mark all pending write requests as failure if the channel is inactive.
+            //isActive() 方法检查 Channel 是否已连接并准备好进行 I/O 操作。
+            //如果 Channel 不是激活状态（例如，连接已关闭或尚未成功建立连接），那么缓冲区里的数据是无法被发送的。
             if (!isActive()) {
                 try {
                     // Check if we need to generate the exception at all.
                     if (!outboundBuffer.isEmpty()) {
+                        //此时，逻辑会进入 if 块：
+                        //if (isOpen()): 如果 Channel 仍是打开状态但未激活（例如，客户端 connect() 尚未成功），则调用 outboundBuffer.failFlushed()，
+                        // 将缓冲区中所有待发送消息的 ChannelPromise 都标记为失败，失败原因为 NotYetConnectedException。
+                        //else: 如果 Channel 已经关闭 (!isOpen())，则同样将所有消息标记为失败，但失败原因为 ClosedChannelException。
                         if (isOpen()) {
                             outboundBuffer.failFlushed(new NotYetConnectedException(), true);
                         } else {
@@ -926,10 +938,16 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
             }
 
             try {
+                //这是一个 抽象方法。AbstractChannel 本身并不知道如何进行具体的网络 I/O 操作（是使用 NIO、Epoll 还是其他方式）。
+                //具体的写入逻辑由子类实现。例如，NioSocketChannel 会重写这个方法，在内部循环地从 outboundBuffer 中取出数据（ByteBuf），
+                // 然后调用 java.nio.channels.SocketChannel.write(byteBuffer) 将数据写入操作系统的 TCP 发送缓冲区。
+                //doWrite 会尽力将 outboundBuffer 中的数据写出，直到写完、写不动（TCP 缓冲区满）或者发生错误。
                 doWrite(outboundBuffer);
             } catch (Throwable t) {
                 handleWriteError(t);
             } finally {
+                //无论写入成功还是失败，finally 块都会被执行。
+                //inFlush0 = false; 这行代码至关重要，它将冲刷标志位重置为 false，使得下一次 flush 操作可以正常进行。
                 inFlush0 = false;
             }
         }

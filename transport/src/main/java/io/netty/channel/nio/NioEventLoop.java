@@ -812,7 +812,7 @@ public final class NioEventLoop extends SingleThreadEventLoop {
             // the NIO JDK channel implementation may throw a NotYetConnectedException.
             if ((readyOps & SelectionKey.OP_CONNECT) != 0) {
                 // remove OP_CONNECT as otherwise Selector.select(..) will always return without blocking
-                // See https://github.com/netty/netty/issues/924
+                // See https://github.com/netty/netty/issues/924s
                 /**
                  * 把 OP_CONNECT 从监听集合里摘掉
                  * JDK bug / 行为：只要 OP_CONNECT 还在监听位里，每次 select 都会立即返回（因为连接已就绪，位一直为 1），于是 EventLoop 空转 → CPU 100 %。
