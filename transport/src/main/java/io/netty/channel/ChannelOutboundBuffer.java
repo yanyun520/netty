@@ -51,7 +51,23 @@ import static java.lang.Math.min;
  * <li>{@link #getUserDefinedWritability(int)} and {@link #setUserDefinedWritability(int, boolean)}</li>
  * </ul>
  * </p>
+ *
+ * 背压流程图：
+ *   addMessage() ─┐
+                   ├─ incrementPendingOutboundBytes()
+                   │     > highWater ─┐
+                   │                  setUnwritable()
+                   │                  fire writabilityChanged
+                   │
+     remove()/writeComplete() ─┐
+                 decrementPendingOutboundBytes()
+                < lowWater ─┐
+                   setWritable()
+                   fire writabilityChanged
+    一句话总结：当待写字节数 >  writeBufferHighWaterMark  时，框架认为“下游吃不动了”，于是把 channel 标成不可写；反之，<  lowWaterMark  时再恢复可写。
+
  */
+
 public final class ChannelOutboundBuffer {
     // Assuming a 64-bit JVM:
     //  - 16 bytes object header
@@ -94,12 +110,14 @@ public final class ChannelOutboundBuffer {
             AtomicLongFieldUpdater.newUpdater(ChannelOutboundBuffer.class, "totalPendingSize");
 
     @SuppressWarnings("UnusedDeclaration")
+    // 当前所有未 flush + 已 flush 但尚未真正写出的字节总数（含对象开销）
     private volatile long totalPendingSize;
 
     private static final AtomicIntegerFieldUpdater<ChannelOutboundBuffer> UNWRITABLE_UPDATER =
             AtomicIntegerFieldUpdater.newUpdater(ChannelOutboundBuffer.class, "unwritable");
 
     @SuppressWarnings("UnusedDeclaration")
+    // 0 表示“可写”；非 0 表示不可写（低 bit 为系统位，高 30 bit 留给用户自定义）
     private volatile int unwritable;
 
     private volatile Runnable fireChannelWritabilityChangedTask;
@@ -111,9 +129,12 @@ public final class ChannelOutboundBuffer {
     /**
      * Add given message to this {@link ChannelOutboundBuffer}. The given {@link ChannelPromise} will be notified once
      * the message was written.
+     * 写入消息时增加背压计数
      */
     public void addMessage(Object msg, int size, ChannelPromise promise) {
+        // 1. 把消息封装成 Entry，size 是业务数据大小，pendingSize 还要加上固定对象开销
         Entry entry = Entry.newInstance(msg, size, total(msg), promise);
+        // 2. 链表追加到尾部
         if (tailEntry == null) {
             flushedEntry = null;
         } else {
@@ -137,6 +158,7 @@ public final class ChannelOutboundBuffer {
 
         // increment pending bytes after adding message to the unflushed arrays.
         // See https://github.com/netty/netty/issues/1619
+        // 3. 重点：累加 pending 字节数，并检查是否触发 “不可写”
         incrementPendingOutboundBytes(entry.pendingSize, false);
     }
 
@@ -178,12 +200,18 @@ public final class ChannelOutboundBuffer {
         incrementPendingOutboundBytes(size, true);
     }
 
+    /**
+       累加 pendingSize（线程安全 CAS）
+     * @param size
+     * @param invokeLater
+     */
     private void incrementPendingOutboundBytes(long size, boolean invokeLater) {
         if (size == 0) {
             return;
         }
-
+        // CAS 更新总字节数
         long newWriteBufferSize = TOTAL_PENDING_SIZE_UPDATER.addAndGet(this, size);
+        // 超过高水位 -> 设置不可写
         if (newWriteBufferSize > channel.config().getWriteBufferHighWaterMark()) {
             setUnwritable(invokeLater);
         }
@@ -197,6 +225,12 @@ public final class ChannelOutboundBuffer {
         decrementPendingOutboundBytes(size, true, true);
     }
 
+    /**
+       减少 pendingSize
+     * @param size
+     * @param invokeLater
+     * @param notifyWritability
+     */
     private void decrementPendingOutboundBytes(long size, boolean invokeLater, boolean notifyWritability) {
         if (size == 0) {
             return;
@@ -293,6 +327,7 @@ public final class ChannelOutboundBuffer {
             if (msg instanceof AbstractReferenceCountedByteBuf) {
                 try {
                     // release now as it is flushed.
+                    // 1. 释放消息内存
                     ((AbstractReferenceCountedByteBuf) msg).release();
                 } catch (Throwable t) {
                     logger.warn("Failed to release a ByteBuf: {}", msg, t);
@@ -300,7 +335,9 @@ public final class ChannelOutboundBuffer {
             } else {
                 ReferenceCountUtil.safeRelease(msg);
             }
+            // 2. 通知 promise 成功
             safeSuccess(promise);
+            // 3. 重点：减少 pending 字节数，并检查是否恢复可写
             decrementPendingOutboundBytes(size, false, true);
         }
 

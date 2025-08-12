@@ -107,7 +107,8 @@ ServerBootstarp中的bind方法
                                                                --- io.netty.channel.nio.AbstractNioByteChannel.doWriteBytes 来到doWriteBytes，由具体子类NioSocketChannel负责执行
                                                                 --- io.netty.channel.socket.nio.NioSocketChannel.doWriteBytes   
                                                                   ps:
-                                                                    buf.readBytes(javaChannel(), buf.g)
+                                                                    buf.readBytes(javaChannel(),buf.readableBytes())
+                                                                  --- 
                                                                  
                                                                 
                                                             

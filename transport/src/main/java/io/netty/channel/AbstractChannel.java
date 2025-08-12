@@ -912,7 +912,6 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
             }
 
             inFlush0 = true;
-
             // Mark all pending write requests as failure if the channel is inactive.
             //isActive() 方法检查 Channel 是否已连接并准备好进行 I/O 操作。
             //如果 Channel 不是激活状态（例如，连接已关闭或尚未成功建立连接），那么缓冲区里的数据是无法被发送的。
