@@ -875,14 +875,22 @@ public final class ChannelOutboundBuffer {
 
         private final EnhancedHandle<Entry> handle;
         Entry next;
+        //消息对象（如  ByteBuf ）
         Object msg;
+        //缓存的 NIO ByteBuffer
         ByteBuffer[] bufs;
         ByteBuffer buf;
+        //写入完成后的回调
         ChannelPromise promise;
+        //已写入字节数
         long progress;
+        //消息总字节数（用于进度通知）
         long total;
+        //消息大小 + overhead
         int pendingSize;
+        //ByteBuf 的 nioBufferCount()，避免重复计算
         int count = -1;
+        //是否被取消
         boolean cancelled;
 
         private Entry(Handle<Entry> handle) {
