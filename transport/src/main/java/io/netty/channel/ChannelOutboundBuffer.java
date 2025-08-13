@@ -653,6 +653,10 @@ public final class ChannelOutboundBuffer {
         return 1 << index;
     }
 
+    /**
+       setWritable / setUnwritable  只做最简单的位操作，没有锁。
+     * @param invokeLater
+     */
     private void setWritable(boolean invokeLater) {
         for (;;) {
             final int oldValue = unwritable;

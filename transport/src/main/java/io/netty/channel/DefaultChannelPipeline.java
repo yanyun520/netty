@@ -1249,6 +1249,10 @@ public class DefaultChannelPipeline implements ChannelPipeline {
         }
     }
 
+
+    /**
+     HeadContext 主要执行底层socket写入和读取的操作
+     */
     final class HeadContext extends AbstractChannelHandlerContext
             implements ChannelOutboundHandler, ChannelInboundHandler {
 

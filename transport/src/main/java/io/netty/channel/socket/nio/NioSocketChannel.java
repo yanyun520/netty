@@ -124,7 +124,7 @@ public class NioSocketChannel extends AbstractNioByteChannel implements io.netty
     }
 
     @Override
-    protected SocketChannel javaChannel() {
+    protected    SocketChannel javaChannel() {
         return (SocketChannel) super.javaChannel();
     }
 
@@ -277,6 +277,7 @@ public class NioSocketChannel extends AbstractNioByteChannel implements io.netty
             promise.setFailure(t);
         }
     }
+
 
     @SuppressJava6Requirement(reason = "Usage guarded by java version check")
     private void shutdownInput0() throws Exception {
