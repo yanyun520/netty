@@ -1,7 +1,7 @@
 
 ##  ChannelFuture cf = bootstrap.bind(6668).sync()  调用栈
 
-```
+```text
 ServerBootstarp中的bind方法
   -- AbstractBootstrap 抽象类中的bind方法
      --- io.netty.bootstrap.AbstractBootstrap#bind()
@@ -116,9 +116,9 @@ ServerBootstarp中的bind方法
 
 ## NioEventLoop 线程的启动原理
 
-```
+```java
   
-  默认的netty服务端启动如下
+
   
   
     public static void main(String[] args) throws Exception {
