@@ -46,6 +46,23 @@ import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 /**
  * Abstract base class for {@link OrderedEventExecutor}'s that execute all its submitted tasks in a single thread.
  *
+ * 外部线程 / 业务代码
+         │  submit(task)
+         ▼
+ ┌──────────────┐
+ │ taskQueue    │  ← LinkedBlockingQueue(默认)
+ └──────────────┘
+         │  1
+         │  2
+         ▼
+ ┌────────────────────────────┐
+ │ SingleThreadEventExecutor  │
+ │  thread  (永远只有 1 条)     │
+ │  ├─ run() 死循环             │
+ │  ├─ takeTask() 取任务        │
+ │  ├─ runAllTasks() 批量执行   |
+ │  └─ confirmShutdown() 优雅停│
+ └────────────────────────────┘
  */
 public abstract class SingleThreadEventExecutor extends AbstractScheduledEventExecutor implements OrderedEventExecutor {
 
@@ -364,7 +381,7 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
 
     /**
      * Poll all tasks from the task queue and run them via {@link Runnable#run()} method.
-     *
+     * 执行所有的任务
      * @return {@code true} if and only if at least one task was run
      */
     protected boolean runAllTasks() {
@@ -981,6 +998,7 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
         return false;
     }
 
+
     private void doStartThread() {
         assert thread == null;
         executor.execute(new Runnable() {
@@ -995,6 +1013,7 @@ public abstract class SingleThreadEventExecutor extends AbstractScheduledEventEx
                 Throwable unexpectedException = null;
                 updateLastExecutionTime();
                 try {
+                    //核心！！！启动xxxEventLoop线程
                     SingleThreadEventExecutor.this.run();
                     success = true;
                 } catch (Throwable t) {

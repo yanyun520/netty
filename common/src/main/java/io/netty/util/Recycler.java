@@ -38,6 +38,8 @@ import static java.lang.Math.min;
  * Light-weight object pool based on a thread-local stack.
  *
  * @param <T> the type of the pooled object
+ * Recycler  = 线程本地双级缓存 + MPSC 共享队列 + 比例节流
+→  在 零 GC 压力 与 极低 CPU 消耗 下，让短生命周期对象 复用率 >90%
  */
 public abstract class Recycler<T> {
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(Recycler.class);
@@ -105,6 +107,7 @@ public abstract class Recycler<T> {
     private final int maxCapacityPerThread;
     private final int interval;
     private final int chunkSize;
+    //线程本地缓存；每个线程一个  LocalPool
     private final FastThreadLocal<LocalPool<T>> threadLocal = new FastThreadLocal<LocalPool<T>>() {
         @Override
         protected LocalPool<T> initialValue() {
@@ -172,6 +175,26 @@ public abstract class Recycler<T> {
         }
     }
 
+
+    /**
+     获取对象 (get() 方法)
+     获取本地池:
+        Recycler 首先通过 threadLocal.get() 获取当前线程的 LocalPool 实例。如果不存在，则创建一个新的。
+        尝试从 L1 缓存获取: localPool.claim() 方法被调用。它首先检查 L1 缓存 batch 是否为空。
+        如果不为空，直接从 batch 的末尾取出一个 DefaultHandle，将其状态设置为 CLAIMED，返回其持有的对象。这是最快的路径。
+        尝试从 L2 缓存填充 L1: 如果 batch 为空，说明 L1 缓存已用尽。此时，
+        系统会尝试从 L2 缓存 pooledHandles 中一次性地“批量”转移 (drain) 一批 (chunkSize 个) DefaultHandle 到 L1 缓存 batch 中。
+        再次尝试从 L1 获取: 填充后，再次从 batch 中获取对象。
+     创建新对象:
+        如果 L1 和 L2 缓存中都没有可用的对象，Recycler 就需要创建一个新的对象。但这里有一个非常重要的节流机制：
+     RATIO 节流:
+        Recycler 并不会每次都创建可回收的新对象。它内部有一个计数器 ratioCounter 和一个比率 RATIO（默认为8）。
+        只有当 ++ratioCounter >= ratioInterval 时（即每 RATIO 次调用），才会创建一个新的、带 DefaultHandle 的可回收对象。
+     NOOP_HANDLE:
+        在其他 RATIO - 1 次调用中，Recycler 会创建一个与 NOOP_HANDLE (空操作句柄) 关联的普通对象。这个对象无法被回收，用完后会被 GC 清理。
+       目的: 这个节流机制是为了防止在流量洪峰时，对象池无限膨胀，导致内存泄漏或占用过多内存。它允许池的容量缓慢、可控地增长。
+     * @return
+     */
     @SuppressWarnings("unchecked")
     public final T get() {
         if (maxCapacityPerThread == 0 || PlatformDependent.isVirtualThread(Thread.currentThread())) {
@@ -222,6 +245,20 @@ public abstract class Recycler<T> {
      */
     protected abstract T newObject(Handle<T> handle);
 
+    /**
+     回收是 Recycler 设计的另一个精髓，完美地处理了同线程回收和跨线程回收两种情况。
+
+     状态检查:
+        recycle() 方法首先会将 DefaultHandle 的状态从 CLAIMED 切换到 AVAILABLE。如果对象已经被回收，会抛出异常，防止重复回收。
+     同线程回收 (Fast Path):
+        localPool.release() 方法会判断，如果执行回收的线程 就是 LocalPool 的所有者线程（Thread.currentThread() == owner），并且 L1 缓存 batch 未满。
+        它会直接将 DefaultHandle 添加到 batch 的末尾。这个过程完全无锁，速度极快。
+     跨线程回收 (Slow Path):
+        如果回收操作发生在另一个线程，或者本线程的 batch 已满。
+        DefaultHandle 会被放入 L2 缓存，即 pooledHandles 这个 MPSC 队列中。
+        MPSC (Multi-Producer, Single-Consumer) 队列: 这种队列允许多个生产者线程（其他回收线程）安全、高效地往队列里添加元素，而只允许一个消费者线程（LocalPool 的所有者线程）从中读取元素。这是通过无锁算法实现的，性能远高于基于锁的队列。
+     * @param <T>
+     */
     @SuppressWarnings("ClassNameSameAsAncestorName") // Can't change this due to compatibility.
     public interface Handle<T> extends ObjectPool.Handle<T>  { }
 
@@ -309,6 +346,7 @@ public abstract class Recycler<T> {
         LocalPool(int maxCapacity, int ratioInterval, int chunkSize) {
             this.ratioInterval = ratioInterval;
             this.chunkSize = chunkSize;
+            //L1 缓存；无锁栈，存最近释放的对象
             batch = new ArrayDeque<DefaultHandle<T>>(chunkSize);
             Thread currentThread = Thread.currentThread();
             owner = !BATCH_FAST_TL_ONLY || currentThread instanceof FastThreadLocalThread ? currentThread : null;

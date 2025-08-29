@@ -41,6 +41,18 @@ import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 /**
  * The default {@link ChannelPipeline} implementation.  It is usually created
  * by a {@link Channel} implementation when the {@link Channel} is created.
+ * 运行结构如下：
+ * Channel
+         │
+         └── DefaultChannelPipeline
+             ├── HeadContext  →  UnSafe  →  Socket
+             ├── HandlerA
+             ├── HandlerB
+             ├── ……
+             └── TailContext   →  兜底处理
+     DefaultChannelPipeline  就是：
+     “线程安全的双向链表 + 事件递归分发器 + 线程切换器”，
+     Head 负责把事件翻译成系统调用，Tail 负责兜底回收资源，其余 handler 只关心业务逻辑
  */
 public class DefaultChannelPipeline implements ChannelPipeline {
 
@@ -60,9 +72,21 @@ public class DefaultChannelPipeline implements ChannelPipeline {
     private static final AtomicReferenceFieldUpdater<DefaultChannelPipeline, MessageSizeEstimator.Handle> ESTIMATOR =
             AtomicReferenceFieldUpdater.newUpdater(
                     DefaultChannelPipeline.class, MessageSizeEstimator.Handle.class, "estimatorHandle");
+    //既是 Inbound 也是 Outbound，真正调用  Unsafe  做 I/O
     final HeadContext head;
+    //纯 Inbound，捕获所有未被业务 handler 处理的「孤儿事件」。
     final TailContext tail;
 
+
+    /**
+      字段	类型	作用
+     `head` / `tail`	`AbstractChannelHandlerContext`	链表哨兵，简化插入/删除逻辑
+     `channel`	`Channel`	pipeline 所属的通道
+     `childExecutors`	`IdentityHashMap`	为每个 handler 按需分配 EventExecutor
+     `registered`	`boolean`	是否已向 EventLoop 注册；决定 handler 回调是否立即触发
+     `pendingHandlerCallbackHead`	`PendingHandlerCallback`	注册前延后调用 `handlerAdded` 的链表
+
+     */
     private final Channel channel;
     private final ChannelFuture succeededFuture;
     private final VoidChannelPromise voidPromise;

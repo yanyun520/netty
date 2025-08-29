@@ -49,6 +49,25 @@ import java.util.concurrent.ConcurrentHashMap;
  * Be aware that this class is marked as {@link Sharable} and so the implementation must be safe to be re-used.
  *
  * @param <C>   A sub-type of {@link Channel}
+ *
+ *
+ * Bootstrap/ServerBootstrap
+    2        │ childHandler(new MyChannelInitializer())
+    3        │
+    4  EventLoop线程
+    5        ├─▶ Channel 注册
+    6        ├─▶ pipeline.fireChannelRegistered()
+    7        │        │
+    8        │        ├─▶ ChannelInitializer.channelRegistered()
+    9        │        │        ├─▶ initChannel(ch)  // 你实现的逻辑
+    10       │        │        ├─▶ pipeline.remove(ChannelInitializer)
+    11       │        │        └─▶ pipeline.fireChannelRegistered()
+    12       │        │
+    13       │        └─▶ 普通用户 Handler...
+
+ *
+ *
+ *
  */
 @Sharable
 public abstract class ChannelInitializer<C extends Channel> extends ChannelInboundHandlerAdapter {
