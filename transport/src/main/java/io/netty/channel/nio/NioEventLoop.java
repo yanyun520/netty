@@ -192,9 +192,12 @@ public final class NioEventLoop extends SingleThreadEventLoop {
             throw new ChannelException("failed to open a new selector", e);
         }
 
+        // 关键判断：是否禁用优化
         if (DISABLE_KEY_SET_OPTIMIZATION) {
             return new SelectorTuple(unwrappedSelector);
         }
+
+
 
         Object maybeSelectorImplClass = AccessController.doPrivileged(new PrivilegedAction<Object>() {
             @Override
@@ -220,9 +223,13 @@ public final class NioEventLoop extends SingleThreadEventLoop {
             return new SelectorTuple(unwrappedSelector);
         }
 
+
+        // ... 反射获取 SelectorImpl 类 ...
         final Class<?> selectorImplClass = (Class<?>) maybeSelectorImplClass;
+        // 创建自定义的 SelectedSelectionKeySet（数组实现）
         final SelectedSelectionKeySet selectedKeySet = new SelectedSelectionKeySet();
 
+        // 使用反射或 Unsafe 替换 Selector 内部的 selectedKeys 字段
         Object maybeException = AccessController.doPrivileged(new PrivilegedAction<Object>() {
             @Override
             public Object run() {
@@ -231,6 +238,7 @@ public final class NioEventLoop extends SingleThreadEventLoop {
                     Field publicSelectedKeysField = selectorImplClass.getDeclaredField("publicSelectedKeys");
 
                     if (PlatformDependent.javaVersion() >= 9 && PlatformDependent.hasUnsafe()) {
+                        // Java 9+ 使用 Unsafe 直接修改内存
                         // Let us try to use sun.misc.Unsafe to replace the SelectionKeySet.
                         // This allows us to also do this in Java9+ without any extra flags.
                         long selectedKeysFieldOffset = PlatformDependent.objectFieldOffset(selectedKeysField);
@@ -247,6 +255,8 @@ public final class NioEventLoop extends SingleThreadEventLoop {
                         // We could not retrieve the offset, lets try reflection as last-resort.
                     }
 
+
+                    // Java 8 或 Unsafe 不可用时，使用反射
                     Throwable cause = ReflectionUtil.trySetAccessible(selectedKeysField, true);
                     if (cause != null) {
                         return cause;
@@ -268,11 +278,12 @@ public final class NioEventLoop extends SingleThreadEventLoop {
         });
 
         if (maybeException instanceof Exception) {
-            selectedKeys = null;
+            selectedKeys = null; // ← 如果优化失败，设置为 null
             Exception e = (Exception) maybeException;
             logger.trace("failed to instrument a special java.util.Set into: {}", unwrappedSelector, e);
             return new SelectorTuple(unwrappedSelector);
         }
+        // ← 优化成功：赋值给 NioEventLoop 的成员变量
         selectedKeys = selectedKeySet;
         logger.trace("instrumented a special java.util.Set into: {}", unwrappedSelector);
         return new SelectorTuple(unwrappedSelector,
@@ -515,100 +526,228 @@ public final class NioEventLoop extends SingleThreadEventLoop {
 
     @Override
     protected void run() {
+        // 计数器：用于检测 select() 是否频繁过早返回（JDK bug 检测机制）
+        // 当 select() 返回但没有就绪事件时，selectCnt 会递增，用于后续判断是否需要重建 Selector
         int selectCnt = 0;
+        
+        // 无限循环：EventLoop 的核心事件循环，只有在 shutdown 时才会退出
         for (;;) {
             try {
+                // 声明策略变量，用于决定本轮循环应该做什么操作（SELECT / CONTINUE / BUSY_WAIT 等）
                 int strategy;
+                
                 try {
+                    // ========== 步骤 1: 计算策略（判断是否有任务待执行）==========
+                    // selectStrategy.calculateStrategy(selectNowSupplier, hasTasks())
+                    // 根据是否有待执行的任务来决定策略：
+                    // - 如果有任务，返回 CONTINUE（继续），跳过 select，直接处理任务
+                    // - 如果没有任务，返回 SELECT，进行阻塞式的 select 等待 I/O 事件
                     strategy = selectStrategy.calculateStrategy(selectNowSupplier, hasTasks());
+                    
+                    // 根据策略进行不同的处理
                     switch (strategy) {
+                    // ========== 策略 1: CONTINUE - 直接跳过 select，继续下一次循环 ==========
+                    // 场景：任务队列中有待处理的任务，优先处理任务而不是阻塞等待 I/O
                     case SelectStrategy.CONTINUE:
                         continue;
 
+                    // ========== 策略 2: BUSY_WAIT - 忙轮询（实际不支持，转为 SELECT）==========
+                    // 注释说明 NIO 不支持忙轮询，所以降级为 SELECT
                     case SelectStrategy.BUSY_WAIT:
                         // fall-through to SELECT since the busy-wait is not supported with NIO
 
+                    // ========== 策略 3: SELECT - 执行 select 操作等待 I/O 事件 ==========
                     case SelectStrategy.SELECT:
+                        // 获取下一个定时任务的截止时间（纳秒），用于 select() 的超时参数
+                        // 例如有定时任务需要在 100ms 后执行，则 select 最多等待 100ms
                         long curDeadlineNanos = nextScheduledTaskDeadlineNanos();
+                        
+                        // 如果返回 -1L（表示没有定时任务），则设置为 NONE（Long.MAX_VALUE）
+                        // NONE 表示可以无限期阻塞，直到有 I/O 事件或外部线程唤醒
                         if (curDeadlineNanos == -1L) {
                             curDeadlineNanos = NONE; // nothing on the calendar
                         }
+                        
+                        // 原子性地设置下一次唤醒时间（用于外部线程调用 wakeup() 时的优化）
+                        // 记录即将进入 select 的阻塞时间点，外部线程可根据此判断是否需要唤醒
                         nextWakeupNanos.set(curDeadlineNanos);
+                        
                         try {
+                            // ========== 关键判断：是否还有待执行的任务 ==========
+                            // 双重检查：在设置唤醒时间后，再次检查是否有新任务加入
+                            // 如果有任务，则不执行 select，直接去处理任务（避免阻塞）
                             if (!hasTasks()) {
+                                // 没有待执行的任务，执行 select 操作
+                                // 参数 curDeadlineNanos 作为超时时间，控制最长阻塞时间
+                                // 返回值是本次 select 返回的就绪事件数量（可能为 0）
+                                //在这里获取Selector中的select
                                 strategy = select(curDeadlineNanos);
                             }
                         } finally {
+                            // 无论 select 是否被执行，都要重置唤醒时间标志
+                            // lazySet 是非原子的赋值，性能更高（因为单线程环境中足够安全）
+                            // 重置为 AWAKE (-1L) 表示 EventLoop 已经苏醒，不需要再唤醒
                             // This update is just to help block unnecessary selector wakeups
                             // so use of lazySet is ok (no race condition)
                             nextWakeupNanos.lazySet(AWAKE);
                         }
+                        
+                        // 穿透 case，继续执行后续逻辑
                         // fall through
                     default:
                     }
                 } catch (IOException e) {
+                    // ========== 异常处理：Selector 异常（通常是 JDK bug）==========
+                    // select() 抛出 IOException 通常表示 Selector 内部出现问题（epoll bug 或其他系统级故障）
+                    // Netty 的解决方案：重建 Selector
                     // If we receive an IOException here its because the Selector is messed up. Let's rebuild
                     // the selector and retry. https://github.com/netty/netty/issues/8566
+                    
+                    // 重建 Selector：创建新的 Selector，将所有已注册的 Channel 迁移到新 Selector
                     rebuildSelector0();
+                    
+                    // 重置 selectCnt 为 0（清除之前的过早返回计数）
                     selectCnt = 0;
+                    
+                    // 处理异常：记录日志并休眠 1 秒，避免异常导致的死循环和 CPU 100%
                     handleLoopException(e);
+                    
+                    // 继续下一次循环（使用新的 Selector）
                     continue;
                 }
 
+                // ========== 步骤 2: 处理 select 结果 ==========
+                
+                // 递增 selectCnt，用于检测 select 是否频繁返回 0（JDK bug）
+                // 每成功执行一次 select，就记录一次计数
                 selectCnt++;
+                
+                // 重置取消的 keys 计数器
+                // cancelledKeys 在 cancel() 方法中递增，这里每轮循环重置
+                // 用于跟踪本轮循环内有多少个 key 被取消
                 cancelledKeys = 0;
+                
+                // 重置 needsToSelectAgain 标志
+                // 此标志在处理 key 时如果需要重新执行 select，会被设置为 true
+                // 这里重置表示上一轮的重新 select 已处理完成
                 needsToSelectAgain = false;
+                
+                // 读取 ioRatio 配置（原子读取，默认为 50）
+                // ioRatio 控制 I/O 操作和普通任务的时间分配比例
+                // 100: 100% 时间做 I/O，0% 时间做普通任务
+                // 50:  50% 时间做 I/O，50% 时间做普通任务
                 final int ioRatio = this.ioRatio;
+                
+                // 标志位：本轮循环是否执行了普通任务
                 boolean ranTasks;
+                
+                // ========== 步骤 3: 根据 ioRatio 分配时间处理 I/O 和任务 ==========
+                
                 if (ioRatio == 100) {
+                    // ========== 模式 1: ioRatio == 100（100% 时间做 I/O，不做任务）==========
+                    // 此模式不考虑时间平衡，直接处理 I/O 再处理任务
                     try {
+                        // 如果 select 返回了就绪事件（strategy > 0），则处理所有就绪的 I/O
                         if (strategy > 0) {
+                            // 处理就绪的 SelectionKey：
+                            // 对每个就绪的 key 执行对应的操作（read / write / connect / accept）
                             processSelectedKeys();
                         }
                     } finally {
                         // Ensure we always run tasks.
+                        // 无论是否处理了 I/O，都要执行待处理的普通任务
+                        // runAllTasks() 不受时间限制，会执行完所有任务再返回
                         ranTasks = runAllTasks();
                     }
                 } else if (strategy > 0) {
+                    // ========== 模式 2: ioRatio != 100 且 select 有返回（strategy > 0）==========
+                    // 此模式根据 ioRatio 比例平衡 I/O 和任务的执行时间
+                    
+                    // 记录处理 I/O 的开始时间（纳秒精度）
                     final long ioStartTime = System.nanoTime();
                     try {
+                        // 处理本次 select 返回的所有就绪的 I/O 事件
                         processSelectedKeys();
                     } finally {
                         // Ensure we always run tasks.
+                        
+                        // 计算处理 I/O 耗用的时间（纳秒）
                         final long ioTime = System.nanoTime() - ioStartTime;
+                        
+                        // 根据 ioRatio 比例计算应该分配给普通任务的时间
+                        // 公式：taskTime = ioTime * (100 - ioRatio) / ioRatio
+                        // 例如 ioRatio=50，ioTime=100ms，则 taskTime = 100 * 50 / 50 = 100ms（1:1 比例）
+                        // 例如 ioRatio=75，ioTime=100ms，则 taskTime = 100 * 25 / 75 ≈ 33ms（3:1 比例）
                         ranTasks = runAllTasks(ioTime * (100 - ioRatio) / ioRatio);
                     }
                 } else {
-                    ranTasks = runAllTasks(0); // This will run the minimum number of tasks
+                    // ========== 模式 3: strategy == 0（select 无返回就绪事件）==========
+                    // 此时说明 select 超时返回或被唤醒但无就绪事件，应该处理任务
+                    // runAllTasks(0) 只执行最小数量的任务（当前任务队列中的所有任务不超过某个最小值）
+                    // This will run the minimum number of tasks
+                    ranTasks = runAllTasks(0);
                 }
 
+                // ========== 步骤 4: 检测并处理 select 的异常情况 ==========
+                
+                // 检查 select 是否过早返回（太快返回但没有处理到任务）
+                // selectReturnPrematurely() 判断：
+                // 1. 如果执行了任务或 strategy > 0，说明有活动，不算异常早返回
+                // 2. 否则说明 select 可能空转，需要重置 selectCnt
                 if (selectReturnPrematurely(selectCnt, ranTasks, strategy)) {
+                    // 重置 selectCnt 为 0，开始新的计数周期
                     selectCnt = 0;
-                } else if (unexpectedSelectorWakeup(selectCnt)) { // Unexpected wakeup (unusual case)
+                } else if (unexpectedSelectorWakeup(selectCnt)) {
+                    // ========== 检测意外的 Selector 唤醒（JDK bug）==========
+                    // unexpectedSelectorWakeup() 检查：
+                    // 1. 线程是否被中断（Thread.interrupted()）
+                    // 2. selectCnt 是否超过阈值（表示频繁空转）
+                    // 如果是，会重建 Selector 或打印警告
+                    
+                    // Unexpected wakeup (unusual case)
+                    // 重置计数器
                     selectCnt = 0;
                 }
             } catch (CancelledKeyException e) {
+                // ========== 捕获 CancelledKeyException 异常 ==========
+                // 当处理已被取消的 SelectionKey 时，可能抛出此异常
+                // 这是一个正常的情况（不是错误），只需记录日志
                 // Harmless exception - log anyway
                 if (logger.isDebugEnabled()) {
                     logger.debug(CancelledKeyException.class.getSimpleName() + " raised by a Selector {} - JDK bug?",
                             selector, e);
                 }
             } catch (Error e) {
+                // ========== 捕获 Error（严重错误，直接抛出）==========
+                // Error 表示 JVM 级别的严重问题（如 OutOfMemoryError），不应该捕获
+                // 直接重新抛出，让调用方处理
                 throw e;
             } catch (Throwable t) {
+                // ========== 捕获其他异常 ==========
+                // 处理所有未预期的异常，记录日志并休眠以防止死循环
                 handleLoopException(t);
             } finally {
+                // ========== Finally 块：优雅关闭处理 ==========
+                // 无论正常执行还是异常，最后都要检查 EventLoop 是否需要关闭
                 // Always handle shutdown even if the loop processing threw an exception.
                 try {
+                    // 检查 EventLoop 是否处于关闭状态
                     if (isShuttingDown()) {
+                        // 关闭所有注册到此 EventLoop 的 Channel
                         closeAll();
+                        
+                        // 确认关闭完成
+                        // confirmShutdown() 返回 true 表示所有 Channel 都已关闭，可以退出循环
                         if (confirmShutdown()) {
+                            // 退出无限循环，EventLoop 线程终止
                             return;
                         }
                     }
                 } catch (Error e) {
+                    // ========== 关闭过程中的 Error（直接抛出）==========
                     throw e;
                 } catch (Throwable t) {
+                    // ========== 关闭过程中的异常（记录日志）==========
                     handleLoopException(t);
                 }
             }
