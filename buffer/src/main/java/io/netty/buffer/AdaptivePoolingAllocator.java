@@ -8,8 +8,8 @@
  *   https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
- * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
  * License for the specific language governing permissions and limitations
  * under the License.
  */
@@ -258,24 +258,64 @@ final class AdaptivePoolingAllocator implements AdaptiveByteBufAllocator.Adaptiv
         return allocate(size, maxCapacity, Thread.currentThread(), null);
     }
 
+    // ========== 核心分配方法：allocate ==========
     private AdaptiveByteBuf allocate(int size, int maxCapacity, Thread currentThread, AdaptiveByteBuf buf) {
+        // ========== 步骤 1: 初始化已分配标志 ==========
+        // allocated 用于记录是否成功分配了内存
+        // 初始值为 null，表示还未尝试分配
         AdaptiveByteBuf allocated = null;
+        
+        // ========== 步骤 2: 检查申请的大小是否在池化范围内 ==========
+        // MAX_POOLED_BUF_SIZE = MAX_CHUNK_SIZE / BUFS_PER_CHUNK = 8MB / 8 = 1MB
+        // 如果申请的大小超过 1MB，则无法使用池化分配器，后续会使用 allocateFallback
         if (size <= MAX_POOLED_BUF_SIZE) {
+            // ========== 步骤 2a: 根据大小计算对应的 size class 索引 ==========
+            // SIZE_CLASSES 中有 16 个预定义的大小类别（32 字节到 16KB）
+            // sizeClassIndexOf(size) 会根据请求的大小返回对应的索引
+            // 例如：申请 100 字节会被映射到 128 字节的 size class
             final int index = sizeClassIndexOf(size);
+            
+            // ========== 步骤 2b: 获取线程本地的 MagazineGroup 数组 ==========
             MagazineGroup[] magazineGroups;
+            
+            // 双重条件判断：
+            // 1. !FastThreadLocalThread.willCleanupFastThreadLocals(currentThread)
+            //    - 如果当前线程不是 FastThreadLocalThread，无法自动清理 FastThreadLocal
+            //    - 此时应该使用全局的 sizeClassedMagazineGroups（非线程本地）
+            // 2. || (magazineGroups = threadLocalGroup.get()) == null
+            //    - 或者尝试获取线程本地的 MagazineGroup[] 失败（返回 null）
+            //    - 这种情况发生在：线程已清理、useCacheForNonEventLoopThreads=false 等场景
             if (!FastThreadLocalThread.willCleanupFastThreadLocals(currentThread) ||
                     (magazineGroups = threadLocalGroup.get()) == null) {
-                magazineGroups =  sizeClassedMagazineGroups;
+                // 使用全局的 MagazineGroup[]（在所有线程间共享，但通过 magazine 的线程亲和性分散竞争）
+                magazineGroups = sizeClassedMagazineGroups;
             }
+            
+            // ========== 步骤 2c: 根据索引选择合适的 MagazineGroup ==========
             if (index < magazineGroups.length) {
+                // index 在有效范围内（0-15，对应 16 个 size class）
+                // 从对应的 MagazineGroup 中分配
                 allocated = magazineGroups[index].allocate(size, maxCapacity, currentThread, buf);
             } else {
+                // index >= 16，说明大小不属于任何 size class
+                // 使用 largeBufferMagazineGroup 处理大型缓冲区（1MB-8MB）
+                // largeBufferMagazineGroup 使用直方图统计，自动调整 chunk 大小
                 allocated = largeBufferMagazineGroup.allocate(size, maxCapacity, currentThread, buf);
             }
         }
+        
+        // ========== 步骤 3: 如果池化分配失败，使用回退方案 ==========
+        // allocated == null 的原因：
+        // - size > MAX_POOLED_BUF_SIZE（超大分配）
+        // - 或者所有 magazine 都处于高竞争状态，无法获取锁
         if (allocated == null) {
+            // allocateFallback 会为这个特定的分配创建一个临时 chunk
+            // 该 chunk 不会被池化，分配完成后会被释放
             allocated = allocateFallback(size, maxCapacity, currentThread, buf);
         }
+        
+        // ========== 步骤 4: 返回分配结果 ==========
+        // 返回值可能为 null（在极端情况下，比如 allocateFallback 也失败）
         return allocated;
     }
 
@@ -701,46 +741,85 @@ final class AdaptivePoolingAllocator implements AdaptiveByteBufAllocator.Adaptiv
             return HISTO_BUCKETS[sizeBucket];
         }
 
+        // ========== 直方图旋转：自适应调整 chunk 大小的核心逻辑 ==========
         private void rotateHistograms() {
+            // ========== 步骤 1: 汇总所有 4 个直方图的数据 ==========
+            // 维护 4 个滑动直方图，每个记录不同时间段的分配大小分布
             short[][] hs = histos;
             for (int i = 0; i < HISTO_BUCKET_COUNT; i++) {
+                // 对每个 bucket，将 4 个直方图中的计数相加
+                // & 0xFFFF 是为了处理 short 的符号扩展，确保得到无符号值
                 sums[i] = (hs[0][i] & 0xFFFF) + (hs[1][i] & 0xFFFF) + (hs[2][i] & 0xFFFF) + (hs[3][i] & 0xFFFF);
             }
+            
+            // ========== 步骤 2: 计算总的分配次数 ==========
+            // 用于计算百分位数（99-percentile）
             int sum = 0;
             for (int count : sums) {
-                sum  += count;
+                sum += count;
             }
+            
+            // ========== 步骤 3: 找出 99-percentile 对应的 bucket ==========
+            // 目标：找到一个大小，使得 99% 的分配都不超过这个大小
             int targetPercentile = (int) (sum * 0.99);
             int sizeBucket = 0;
             for (; sizeBucket < sums.length; sizeBucket++) {
                 if (sums[sizeBucket] > targetPercentile) {
+                    // 找到了累积分配数超过 99% 阈值的 bucket
                     break;
                 }
                 targetPercentile -= sums[sizeBucket];
             }
+            
+            // ========== 步骤 4: 计算首选 chunk 大小 ==========
+            // hasHadRotation 标志第一次旋转
             hasHadRotation = true;
+            
+            // bucketToSize(sizeBucket) 返回该 bucket 对应的大小范围
+            // 例如 bucket 5 对应 96KB，bucket 10 对应 512KB
             int percentileSize = bucketToSize(sizeBucket);
+            
+            // BUFS_PER_CHUNK = 8：每个 chunk 应该能容纳约 8 个这样的分配
+            // 这样设计可以减少 chunk 碎片化
             int prefChunkSize = Math.max(percentileSize * BUFS_PER_CHUNK, MIN_CHUNK_SIZE);
+            
+            // localUpperBufSize 用于预测缓冲区容量
             localUpperBufSize = percentileSize;
             localPrefChunkSize = prefChunkSize;
+            
+            // ========== 步骤 5: 在共享环境中选择最大的首选大小 ==========
+            // 如果多个 magazine 共享这个 controller（shareable=true）
+            // 需要确保所有 magazine 都使用一致的 chunk 大小
             if (shareable) {
+                // 遍历所有 magazine，找出最大的 localPrefChunkSize
                 for (Magazine mag : group.magazines) {
                     HistogramChunkController statistics = (HistogramChunkController) mag.chunkController;
                     prefChunkSize = Math.max(prefChunkSize, statistics.localPrefChunkSize);
                 }
             }
+            
+            // ========== 步骤 6: 根据首选大小是否变化，调整下次旋转的频率 ==========
             if (sharedPrefChunkSize != prefChunkSize) {
-                // Preferred chunk size changed. Increase check frequency.
+                // ========== 大小改变：需要频繁检查（响应工作负载变化） ==========
+                // datumTarget 是触发旋转的阈值
+                // >> 1 相当于除以 2，增加检查频率
                 datumTarget = Math.max(datumTarget >> 1, MIN_DATUM_TARGET);
+                // 更新全局首选大小
                 sharedPrefChunkSize = prefChunkSize;
             } else {
-                // Preferred chunk size did not change. Check less often.
+                // ========== 大小未变：降低检查频率（节省开销） ==========
+                // << 1 相当于乘以 2，降低检查频率
+                // 上限是 MAX_DATUM_TARGET = 65534
                 datumTarget = Math.min(datumTarget << 1, MAX_DATUM_TARGET);
             }
 
+            // ========== 步骤 7: 轮转直方图，清空最旧的直方图 ==========
+            // histoIndex 循环在 0-3 之间
+            // 每次旋转时，最旧的直方图被清空并重复使用
             histoIndex = histoIndex + 1 & 3;
             histo = histos[histoIndex];
             datumCount = 0;
+            // 清空新轮转的直方图
             Arrays.fill(histo, (short) 0);
         }
 
@@ -907,119 +986,151 @@ final class AdaptivePoolingAllocator implements AdaptiveByteBufAllocator.Adaptiv
             return allocated;
         }
 
+        // ========== Magazine 分配方法：allocate（处理竞争和高性能） ==========
         private boolean allocate(int size, int maxCapacity, AdaptiveByteBuf buf, boolean reallocate) {
+            // ========== 步骤 1: 计算初始容量 ==========
+            // chunkController 根据申请的大小和历史数据计算合理的初始容量
+            // isReallocation=true 表示这是一个扩容操作，可能需要特殊处理
             int startingCapacity = chunkController.computeBufferCapacity(size, maxCapacity, reallocate);
+            
+            // ========== 步骤 2: 尝试使用当前的 chunk ==========
+            // current 是 magazine 正在分配的 chunk，通常有部分空间可用
             Chunk curr = current;
             if (curr != null) {
-                // We have a Chunk that has some space left.
+                // ========== 情况 2a: current chunk 有足够的剩余空间 ==========
                 int remainingCapacity = curr.remainingCapacity();
                 if (remainingCapacity > startingCapacity) {
+                    // 剩余空间 > 初始容量：直接从当前 chunk 分配
+                    // 这是最快的路径（fast path），无需获取锁
                     curr.readInitInto(buf, size, startingCapacity, maxCapacity);
-                    // We still have some bytes left that we can use for the next allocation, just early return.
+                    // 不修改 current，继续为下一个分配使用这个 chunk
                     return true;
                 }
 
-                // At this point we know that this will be the last time current will be used, so directly set it to
-                // null and release it once we are done.
+                // ========== 情况 2b: current chunk 即将耗尽 ==========
+                // 将 current 设为 null，表示即将切换到 next chunk
                 current = null;
+                
+                // 检查剩余空间是否至少满足申请的大小
                 if (remainingCapacity >= size) {
+                    // 虽然空间不足以满足初始容量需求，但足够满足实际大小需求
+                    // 使用剩余的全部空间
                     try {
                         curr.readInitInto(buf, size, remainingCapacity, maxCapacity);
                         return true;
                     } finally {
+                        // 无论成功或失败，都要释放这个耗尽的 chunk
                         curr.releaseFromMagazine();
                     }
                 }
 
-                // Check if we either retain the chunk in the nextInLine cache or releasing it.
+                // ========== 情况 2c: current chunk 剩余空间不足，检查是否缓存 ==========
+                // RETIRE_CAPACITY = 256 字节
+                // 如果剩余空间 < 256 字节，认为太小，直接释放（不值得缓存）
                 if (remainingCapacity < RETIRE_CAPACITY) {
+                    // 释放小于 256 字节的 chunk（无法继续使用）
                     curr.releaseFromMagazine();
                 } else {
-                    // See if it makes sense to transfer the Chunk to the nextInLine cache for later usage.
-                    // This method will release curr if this is not the case
+                    // ========== 缓存即将耗尽的 chunk 到 nextInLine ==========
+                    // 这样下一次快速分配失败时，可以快速获得这个 chunk
+                    // transferToNextInLineOrRelease 会尝试将 chunk 缓存到 nextInLine
+                    // 如果失败（nextInLine 已满），则释放 chunk 或放入共享队列
                     transferToNextInLineOrRelease(curr);
                 }
             }
 
+            // ========== 断言：current 已清空 ==========
             assert current == null;
-            // The fast-path for allocations did not work.
-            //
-            // Try to fetch the next "Magazine local" Chunk first, if this fails because we don't have a
-            // next-in-line chunk available, we will poll our centralQueue.
-            // If this fails as well we will just allocate a new Chunk.
-            //
-            // In any case we will store the Chunk as the current so it will be used again for the next allocation and
-            // thus be "reserved" by this Magazine for exclusive usage.
+            
+            // ========== 步骤 3: 尝试使用 nextInLine 的 chunk ==========
+            // nextInLine 是之前缓存的"next"chunk，为即将耗尽 current 做准备
+            // 使用原子操作 getAndSet(this, null) 获取并清空
             curr = NEXT_IN_LINE.getAndSet(this, null);
             if (curr != null) {
+                // ========== 检查 nextInLine 是否被释放 ==========
+                // 在高竞争情况下，magazine 可能被扩容并释放，此时 nextInLine 会被设为 MAGAZINE_FREED
                 if (curr == MAGAZINE_FREED) {
-                    // Allocation raced with a stripe-resize that freed this magazine.
+                    // Magazine 被释放，恢复这个状态
                     restoreMagazineFreed();
                     return false;
                 }
 
+                // ========== 类似的流程：检查 nextInLine chunk 的容量 ==========
                 int remainingCapacity = curr.remainingCapacity();
                 if (remainingCapacity > startingCapacity) {
-                    // We have a Chunk that has some space left.
+                    // nextInLine chunk 有足够空间
                     curr.readInitInto(buf, size, startingCapacity, maxCapacity);
-                    current = curr;
+                    current = curr; // 将其升级为 current，供下一次分配使用
                     return true;
                 }
 
+                // ========== nextInLine chunk 刚好够用 ==========
                 if (remainingCapacity >= size) {
-                    // At this point we know that this will be the last time curr will be used, so directly set it to
-                    // null and release it once we are done.
                     try {
                         curr.readInitInto(buf, size, remainingCapacity, maxCapacity);
                         return true;
                     } finally {
-                        // Release in a finally block so even if readInitInto(...) would throw we would still correctly
-                        // release the current chunk before null it out.
                         curr.releaseFromMagazine();
                     }
                 } else {
-                    // Release it as it's too small.
+                    // nextInLine chunk 太小，直接释放
                     curr.releaseFromMagazine();
                 }
             }
 
-            // Now try to poll from the central queue first
+            // ========== 步骤 4: fast path 都失败，尝试从共享队列获取 chunk ==========
+            // sharedChunkQueue 是一个全局的、所有 magazine 共享的队列
+            // 存放被其他 magazine 释放但仍可用的 chunk
             curr = sharedChunkQueue.poll();
             if (curr == null) {
+                // 共享队列为空，创建全新的 chunk
+                // chunkController.newChunkAllocation 会根据历史数据决定 chunk 大小
                 curr = chunkController.newChunkAllocation(size, this);
             } else {
+                // ========== 从共享队列获取的 chunk 需要重新附加到这个 magazine ==========
                 curr.attachToMagazine(this);
 
+                // ========== 检查获取的 chunk 是否足够大 ==========
                 int remainingCapacity = curr.remainingCapacity();
                 if (remainingCapacity < size) {
-                    // Check if we either retain the chunk in the nextInLine cache or releasing it.
+                    // 这个 chunk 太小，无法满足申请
                     if (remainingCapacity < RETIRE_CAPACITY) {
+                        // 太小了，直接释放
                         curr.releaseFromMagazine();
                     } else {
-                        // See if it makes sense to transfer the Chunk to the nextInLine cache for later usage.
-                        // This method will release curr if this is not the case
+                        // 还可以缓存，放入 nextInLine
                         transferToNextInLineOrRelease(curr);
                     }
+                    // 创建新的 chunk 来满足这个分配请求
                     curr = chunkController.newChunkAllocation(size, this);
                 }
             }
 
+            // ========== 步骤 5: 使用获取的 chunk（新建或共享队列中获取） ==========
+            // 将 curr 设为 current，标记为"当前正在使用"的 chunk
             current = curr;
             try {
+                // ========== 最后的分配尝试 ==========
                 int remainingCapacity = curr.remainingCapacity();
+                // 由于 curr 是新建或重新选择的，应该有足够空间
                 assert remainingCapacity >= size;
+                
+                // 根据剩余空间决定是否使用初始容量
                 if (remainingCapacity > startingCapacity) {
+                    // 用初始容量（受历史数据影响，可能小于剩余空间）
                     curr.readInitInto(buf, size, startingCapacity, maxCapacity);
-                    curr = null;
+                    curr = null; // 标记已成功使用，不需要在 finally 中释放
                 } else {
+                    // 用全部剩余空间（chunk 会被彻底耗尽）
                     curr.readInitInto(buf, size, remainingCapacity, maxCapacity);
                 }
             } finally {
+                // ========== 安全清理 ==========
+                // 如果 curr 仍不为 null，说明初始化失败，需要释放和重置状态
                 if (curr != null) {
-                    // Release in a finally block so even if readInitInto(...) would throw we would still correctly
-                    // release the current chunk before null it out.
+                    // readInitInto(...) 失败时需要清理
                     curr.releaseFromMagazine();
-                    current = null;
+                    current = null; // 重置 current
                 }
             }
             return true;
