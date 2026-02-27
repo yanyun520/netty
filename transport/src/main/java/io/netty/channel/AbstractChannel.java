@@ -897,58 +897,103 @@ public abstract class AbstractChannel extends DefaultAttributeMap implements Cha
 
         @SuppressWarnings("deprecation")
         protected void flush0() {
-            //inFlush0 是一个布尔标志位，默认为 false。
-            //方法首先检查 inFlush0 是否为 true。如果是，意味着当前已经有一个 flush0 操作正在执行中。
-            //目的：为了防止并发或递归调用 flush0 导致数据错乱或无限循环。例如，一个 doWrite 的实现可能间接触发了另一次 flush。这个检查保证了在同一时间点，只有一个 flush 流程在执行。
-            if (inFlush0) {  // 重入保护
+            // ========== 步骤 1: 重入保护检查 ==========
+            // inFlush0 是一个布尔标志位，初始值为 false
+            // 作用：防止 flush0 被递归调用或并发调用
+            // 场景：例如在 doWrite() 中可能会间接触发另一个 flush()，如果不防护就会导致数据错乱或无限循环
+            // 原理：单线程模型中，EventLoop 线程是唯一访问此方法的线程，所以简单的布尔检查就足够了
+            if (inFlush0) {
+                // 如果已经在 flush，则直接返回，避免重入
                 // Avoid re-entrance
                 return;
             }
 
-            //outboundBuffer 是 ChannelOutboundBuffer 类型的对象，它是一个专门用于缓存待发送数据的队列。当调用 channel.write(msg) 时，消息 msg 并没有被立即发送，而是被添加到了这个缓冲区中。
-            //这里会检查 outboundBuffer 是否为 null（通常在 Channel 关闭后会设为 null）或者是否为空（isEmpty()）。
-            //目的：如果没有任何数据需要发送，就直接返回，避免不必要的后续操作。
+            // ========== 步骤 2: 获取出站缓冲区并检查是否有数据需要发送 ==========
+            // outboundBuffer 是 ChannelOutboundBuffer 实例，专门用于缓存待发送的数据
+            // 当调用 channel.write(msg) 时，msg 并不被立即发送，而是被加入到这个缓冲区
             final ChannelOutboundBuffer outboundBuffer = this.outboundBuffer;
+            
+            // 检查两个条件：
+            // 1. outboundBuffer == null：通常在 Channel 关闭后会被设置为 null，表示不允许再写入数据
+            // 2. outboundBuffer.isEmpty()：缓冲区中没有任何消息需要发送
+            // 目的：如果缓冲区为空，无需进行任何写操作，直接返回以优化性能
             if (outboundBuffer == null || outboundBuffer.isEmpty()) {
+                // 没有数据需要发送，早期返回
                 return;
             }
 
+            // ========== 步骤 3: 设置 flush 进行中标志 ==========
+            // 设置 inFlush0 = true，表示现在正在执行 flush 操作
+            // 这个标志会被外层任何 flush() 调用检查，如果为 true 则直接返回
             inFlush0 = true;
+            
+            // ========== 步骤 4: 检查 Channel 是否处于活跃状态（连接已建立）==========
+            // isActive() 返回 true 表示 Channel 已连接且可以进行 I/O 操作
+            // isActive() 返回 false 表示 Channel 未连接、已关闭或处于中间状态
             // Mark all pending write requests as failure if the channel is inactive.
-            //isActive() 方法检查 Channel 是否已连接并准备好进行 I/O 操作。
-            //如果 Channel 不是激活状态（例如，连接已关闭或尚未成功建立连接），那么缓冲区里的数据是无法被发送的。
             if (!isActive()) {
+                // ========== 情况 1: Channel 非活跃（未连接/已关闭）==========
                 try {
+                    // 二次检查：缓冲区是否真的非空
+                    // 目的：避免在 inFlush0 设置后但尚未执行 doWrite 时，缓冲区被其他线程清空
                     // Check if we need to generate the exception at all.
                     if (!outboundBuffer.isEmpty()) {
-                        //此时，逻辑会进入 if 块：
-                        //if (isOpen()): 如果 Channel 仍是打开状态但未激活（例如，客户端 connect() 尚未成功），则调用 outboundBuffer.failFlushed()，
-                        // 将缓冲区中所有待发送消息的 ChannelPromise 都标记为失败，失败原因为 NotYetConnectedException。
-                        //else: 如果 Channel 已经关闭 (!isOpen())，则同样将所有消息标记为失败，但失败原因为 ClosedChannelException。
+                        // 此时需要将缓冲区中所有待发送的消息标记为失败
+                        // 原因：既然 Channel 不活跃，这些消息无法被发送，应该立即失败处理
+                        
+                        // ========== 子情况 1a: Channel 仍然是开放的 (isOpen == true) ==========
                         if (isOpen()) {
+                            // Channel 打开但未连接的典型场景：
+                            // - 客户端已调用 connect() 但连接还未完成
+                            // - ServerSocket 还未被 accept
+                            // 此时应该用 NotYetConnectedException 标记所有消息为失败
+                            // 第二个参数 true 表示触发 channelWritabilityChanged 事件
                             outboundBuffer.failFlushed(new NotYetConnectedException(), true);
                         } else {
+                            // ========== 子情况 1b: Channel 已经关闭 (isOpen == false) ==========
+                            // Channel 完全关闭，无法进行任何 I/O 操作
+                            // 用 ClosedChannelException 标记所有消息为失败
+                            // 第二个参数 false 表示不触发 channelWritabilityChanged 事件
+                            // 原因：Channel 已关闭，不需要通知可写性变化
                             // Do not trigger channelWritabilityChanged because the channel is closed already.
                             outboundBuffer.failFlushed(newClosedChannelException(initialCloseCause, "flush0()"), false);
                         }
                     }
                 } finally {
+                    // ========== 最关键的地方：重置 flush 标志 ==========
+                    // 无论上面执行了什么，这里都要重置 inFlush0 = false
+                    // 目的：允许后续的 flush() 调用正常执行（虽然数据都失败了，但标志要重置）
+                    // 如果这里不重置，下一次 flush() 会因为重入检查而直接返回，导致无法处理新的消息
                     inFlush0 = false;
                 }
+                // 早期返回：既然 Channel 非活跃，无需进行真实的写操作
                 return;
             }
 
+            // ========== 步骤 5: Channel 是活跃的，执行真实的写操作 ==========
             try {
-                //这是一个 抽象方法。AbstractChannel 本身并不知道如何进行具体的网络 I/O 操作（是使用 NIO、Epoll 还是其他方式）。
-                //具体的写入逻辑由子类实现。例如，NioSocketChannel 会重写这个方法，在内部循环地从 outboundBuffer 中取出数据（ByteBuf），
-                // 然后调用 java.nio.channels.SocketChannel.write(byteBuffer) 将数据写入操作系统的 TCP 发送缓冲区。
-                //doWrite 会尽力将 outboundBuffer 中的数据写出，直到写完、写不动（TCP 缓冲区满）或者发生错误。
+                // 调用子类实现的 doWrite() 方法
+                // doWrite() 是一个抽象方法，由具体的 Channel 实现（如 NioSocketChannel）来实现
+                // 其职责是：
+                // 1. 从 outboundBuffer 中循环取出待发送的 ByteBuf
+                // 2. 调用底层网络 API（如 SocketChannel.write()）将数据写入操作系统 TCP 缓冲区
+                // 3. 处理写半包情况（TCP 缓冲区满导致数据未全部写出）
+                // 4. 维护 OP_WRITE 事件的注册状态
+                // 5. 清理已成功发送的消息的 Promise
                 doWrite(outboundBuffer);
             } catch (Throwable t) {
+                // ========== 异常处理：写操作失败 ==========
+                // doWrite() 可能抛出以下异常：
+                // - IOException：网络层异常（连接断开、权限不足等）
+                // - RuntimeException：业务逻辑异常（消息序列化失败等）
+                // handleWriteError() 会根据异常类型和配置决定是否关闭 Channel
                 handleWriteError(t);
             } finally {
-                //无论写入成功还是失败，finally 块都会被执行。
-                //inFlush0 = false; 这行代码至关重要，它将冲刷标志位重置为 false，使得下一次 flush 操作可以正常进行。
+                // ========== 最关键的地方：重置 flush 进行中标志 ==========
+                // 无论 doWrite() 成功还是失败，都要重置 inFlush0 = false
+                // 目的：允许后续的 flush() 调用继续执行
+                // 这是一个"保证"（guarantee）：无论发生什么，flush 标志一定会被重置
+                // 如果这里的 finally 块不执行，EventLoop 线程就会永久卡住，后续所有 flush 都会被拦截
                 inFlush0 = false;
             }
         }
