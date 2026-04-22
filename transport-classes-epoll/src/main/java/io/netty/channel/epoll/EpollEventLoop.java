@@ -46,6 +46,15 @@ import static java.lang.Math.min;
 /**
  * {@link EventLoop} which uses epoll under the covers. Only works on Linux!
  */
+/**
+ * EpollEventLoop 是专门针对 Linux epoll 机制的事件循环实现。
+ * 
+ * 设计理由：
+ * 1. 继承 SingleThreadEventLoop，保证线程安全和事件处理的串行性
+ * 2. 利用 Linux epoll 提供高性能、低延迟的 I/O 多路复用机制
+ * 3. 优化网络事件处理，支持高并发、高吞吐量场景
+ * 4. 提供细粒度的事件监听和处理能力
+ */
 public class EpollEventLoop extends SingleThreadEventLoop {
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(EpollEventLoop.class);
     private static final long EPOLL_WAIT_MILLIS_THRESHOLD =
@@ -57,11 +66,29 @@ public class EpollEventLoop extends SingleThreadEventLoop {
         Epoll.ensureAvailability();
     }
 
+    // epollFd: 用于 Linux epoll 实例的文件描述符
+    // 设计理由：创建 epoll 实例，用于高效监听多个文件描述符上的 I/O 事件
     private FileDescriptor epollFd;
+
+    // eventFd: 用于异步事件通知的文件描述符
+    // 设计理由：支持在不同线程间低开销地发送事件通知，实现高效的事件唤醒机制
     private FileDescriptor eventFd;
+
+    // timerFd: 定时器文件描述符
+    // 设计理由：提供精确的定时器功能，允许在 epoll 中直接监听定时事件，减少额外系统调用
     private FileDescriptor timerFd;
+
+    // channels: 维护文件描述符到 EpollChannel 的映射
+    // 设计理由：提供快速的 fd 到 Channel 查找，支持高效的事件分发和管理
+    // 初始大小 4096，预留足够空间以减少扩容开销
     private final IntObjectMap<AbstractEpollChannel> channels = new IntObjectHashMap<AbstractEpollChannel>(4096);
+
+    // allowGrowing: 是否允许 events 数组动态增长
+    // 设计理由：在高负载场景下，自动扩展 events 数组以适应突发性能需求
     private final boolean allowGrowing;
+
+    // events: 存储 epoll 返回的就绪事件数组
+    // 设计理由：减少内存分配开销，重复使用同一个数组，提高性能
     private final EpollEventArray events;
 
     // These are initialized on first use
@@ -321,60 +348,74 @@ public class EpollEventLoop extends SingleThreadEventLoop {
         return Native.epollWait(epollFd, events, 1000);
     }
 
+    /**
+     * EpollEventLoop 的核心事件循环方法，实现复杂的事件处理和任务调度逻辑。
+     * 
+     * 设计理由：
+     * 1. 提供高性能、低延迟的事件驱动模型
+     * 2. 灵活的任务调度策略
+     * 3. 平衡 I/O 事件处理和其他任务执行
+     * 4. 支持动态唤醒和超时控制
+     * 5. 异常处理和优雅关闭
+     */
     @Override
     protected void run() {
+        // prevDeadlineNanos: 记录上一次定时器截止时间，避免不必要的定时器重新设置
         long prevDeadlineNanos = NONE;
+        
+        // 无限循环，持续处理事件和任务
         for (;;) {
             try {
+                // 根据当前状态选择事件处理策略
+                // 设计理由：提供灵活的事件处理模式，如立即返回、忙等待、阻塞等待
                 int strategy = selectStrategy.calculateStrategy(selectNowSupplier, hasTasks());
                 switch (strategy) {
                     case SelectStrategy.CONTINUE:
+                        // 无需处理，继续下一轮循环
                         continue;
 
                     case SelectStrategy.BUSY_WAIT:
+                        // 高频繁事件时采用忙等待，减少系统调用开销
                         strategy = epollBusyWait();
                         break;
 
                     case SelectStrategy.SELECT:
+                        // 阻塞等待事件，处理复杂的定时和唤醒逻辑
                         if (pendingWakeup) {
-                            // We are going to be immediately woken so no need to reset wakenUp
-                            // or check for timerfd adjustment.
+                            // 有挂起的唤醒事件，限时等待
                             strategy = epollWaitTimeboxed();
                             if (strategy != 0) {
                                 break;
                             }
-                            // We timed out so assume that we missed the write event due to an
-                            // abnormally failed syscall (the write itself or a prior epoll_wait)
+                            // 超时处理：可能发生异常的系统调用
                             logger.warn("Missed eventfd write (not seen after > 1 second)");
                             pendingWakeup = false;
                             if (hasTasks()) {
                                 break;
                             }
-                            // fall-through
                         }
 
+                        // 计算下一个定时任务的截止时间
                         long curDeadlineNanos = nextScheduledTaskDeadlineNanos();
                         if (curDeadlineNanos == -1L) {
-                            curDeadlineNanos = NONE; // nothing on the calendar
+                            curDeadlineNanos = NONE; // 无定时任务
                         }
                         nextWakeupNanos.set(curDeadlineNanos);
+                        
                         try {
                             if (!hasTasks()) {
                                 if (curDeadlineNanos == prevDeadlineNanos) {
-                                    // No timer activity needed
+                                    // 无需调整定时器
                                     strategy = epollWaitNoTimerChange();
                                 } else {
-                                    // Timerfd needs to be re-armed or disarmed
+                                    // 重新设置或取消定时器
                                     long result = epollWait(curDeadlineNanos);
-                                    // The result contains the actual return value and if a timer was used or not.
-                                    // We need to "unpack" using the helper methods exposed in Native.
                                     strategy = Native.epollReady(result);
                                     prevDeadlineNanos = Native.epollTimerWasUsed(result) ? curDeadlineNanos : NONE;
                                 }
                             }
                         } finally {
-                            // Try get() first to avoid much more expensive CAS in the case we
-                            // were woken via the wakeup() method (submitted task)
+                            // 处理可能的异步唤醒
                             if (nextWakeupNanos.get() == AWAKE || nextWakeupNanos.getAndSet(AWAKE) == AWAKE) {
                                 pendingWakeup = true;
                             }
@@ -383,40 +424,48 @@ public class EpollEventLoop extends SingleThreadEventLoop {
                     default:
                 }
 
+                // I/O 事件处理比例控制
+                // 设计理由：平衡 I/O 和非 I/O 任务的执行时间
                 final int ioRatio = this.ioRatio;
                 if (ioRatio == 100) {
+                    // 100% 用于 I/O，性能最大化
                     try {
                         if (strategy > 0 && processReady(events, strategy)) {
                             prevDeadlineNanos = NONE;
                         }
                     } finally {
-                        // Ensure we always run tasks.
+                        // 确保执行所有任务
                         runAllTasks();
                     }
                 } else if (strategy > 0) {
+                    // 动态分配 I/O 和任务执行时间
                     final long ioStartTime = System.nanoTime();
                     try {
                         if (processReady(events, strategy)) {
                             prevDeadlineNanos = NONE;
                         }
                     } finally {
-                        // Ensure we always run tasks.
+                        // 根据 I/O 耗时计算任务执行时间
                         final long ioTime = System.nanoTime() - ioStartTime;
                         runAllTasks(ioTime * (100 - ioRatio) / ioRatio);
                     }
                 } else {
-                    runAllTasks(0); // This will run the minimum number of tasks
+                    // 无 I/O 事件时执行最小数量任务
+                    runAllTasks(0);
                 }
+
+                // 动态扩展事件数组
+                // 设计理由：适应高负载场景，避免事件丢失
                 if (allowGrowing && strategy == events.length()) {
-                    //increase the size of the array as we needed the whole space for the events
                     events.increase();
                 }
             } catch (Error e) {
                 throw e;
             } catch (Throwable t) {
+                // 处理非致命异常，避免事件循环中断
                 handleLoopException(t);
             } finally {
-                // Always handle shutdown even if the loop processing threw an exception.
+                // 处理关闭流程，确保资源正确释放
                 try {
                     if (isShuttingDown()) {
                         closeAll();
